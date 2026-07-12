@@ -22,12 +22,27 @@ logger = logging.getLogger(__name__)
 # Build the asyncpg DSN from DATABASE_URL (Replit provides this as a pg:// URL)
 def _build_dsn() -> str:
     url = os.environ["DATABASE_URL"]
-    # Replit provides postgres:// — asyncpg needs postgresql+asyncpg://
+    # Normalise scheme so asyncpg driver is used regardless of the source host
+    # (Replit provides postgres://, Neon/Supabase/Railway provide postgresql://)
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif url.startswith("postgresql://"):
+    elif url.startswith("postgresql://") and "+asyncpg" not in url:
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    # Strip ?sslmode=require from the DSN string — asyncpg handles SSL via
+    # connect_args instead; leaving it in the URL causes a parse error.
+    if "?sslmode=" in url:
+        url = url.split("?sslmode=")[0]
     return url
+
+
+def _ssl_args() -> dict:
+    """Return connect_args that enable SSL when the original URL requests it."""
+    raw = os.environ.get("DATABASE_URL", "")
+    if "sslmode=require" in raw or "neon.tech" in raw or "supabase" in raw:
+        import ssl
+        ctx = ssl.create_default_context()
+        return {"ssl": ctx}
+    return {}
 
 
 engine: AsyncEngine = create_async_engine(
@@ -36,6 +51,7 @@ engine: AsyncEngine = create_async_engine(
     max_overflow=DB_MAX_OVERFLOW,
     pool_pre_ping=True,          # detect dead connections and replace them
     echo=False,
+    connect_args=_ssl_args(),    # enables SSL for Neon/Supabase/Railway etc.
 )
 
 AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
