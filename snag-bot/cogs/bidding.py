@@ -27,6 +27,7 @@ from database.engine import AsyncSessionLocal
 from database.models import Listing, Bid, UserProfile
 from utils.checks import check_marketplace_access, is_globally_banned, is_guild_banned
 from utils.embeds import build_error_embed, build_success_embed
+from utils.parsing import parse_amount
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class PlaceBidModal(discord.ui.Modal, title="Place Bid"):
         self._guild_id = guild_id
         self.bid_input = discord.ui.TextInput(
             label=f"Your bid (current: {current_bid or 'none'} {currency})",
-            placeholder="Enter a number",
+            placeholder="e.g. 500, 10k, 2.5m, 1b",
             max_length=20,
         )
         self.add_item(self.bid_input)
@@ -65,12 +66,15 @@ class PlaceBidModal(discord.ui.Modal, title="Place Bid"):
             )
             return
 
-        # Parse amount
+        # Parse amount (supports shorthand like 10k, 2.5m, 1b)
         try:
-            amount = float(self.bid_input.value.strip().replace(",", ""))
+            amount = parse_amount(self.bid_input.value.strip())
         except ValueError:
             await interaction.followup.send(
-                embed=build_error_embed("Bid must be a number."), ephemeral=True
+                embed=build_error_embed(
+                    "Bid must be a number, optionally with a k/m/b suffix (e.g. 500, 10k, 2.5m, 1b)."
+                ),
+                ephemeral=True,
             )
             return
 

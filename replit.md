@@ -2,6 +2,10 @@
 
 A Discord bot for trading items, services, and auctions across multiple servers, with a focus on Minecraft SMP communities (Donut SMP flagship). Listings can be server-scoped or broadcast globally; all deal negotiation happens in DMs.
 
+## User preferences
+
+- **Do not host/run this bot on Replit.** The owner already runs it on their own host. The "Snag Discord Bot" workflow exists because it was auto-generated on import — leave it stopped; don't start it or suggest deploying/publishing this bot from Replit. Use this Repl for code edits only.
+
 ## Run & Operate
 
 - **Start the bot:** use the "Snag Discord Bot" workflow in Replit

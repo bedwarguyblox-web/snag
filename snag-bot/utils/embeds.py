@@ -106,9 +106,6 @@ def build_listing_embed(listing, seller_profile=None, guild_color: int | None = 
         ts = int(listing.auction_end_at.timestamp())
         embed.add_field(name="Auction Ends", value=f"<t:{ts}:R>", inline=True)
 
-    if listing.image_url:
-        embed.set_image(url=listing.image_url)
-
     embed.set_footer(text=f"Listing #{listing.listing_id} • {listing.status.title()}")
 
     add_invite_branding(embed)

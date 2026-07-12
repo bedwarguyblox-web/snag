@@ -32,6 +32,7 @@ from database.models import GuildConfig, Listing, UserProfile
 from utils.checks import check_marketplace_access, get_or_create_profile
 from utils.embeds import build_listing_embed, build_error_embed, build_success_embed, add_invite_branding
 from utils.pagination import PaginatorView
+from utils.parsing import parse_amount
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ class ListingDetailsModal(discord.ui.Modal, title="Listing Details"):
     )
     price_input = discord.ui.TextInput(
         label="Price / Starting Bid",
-        placeholder="e.g. 500",
+        placeholder="e.g. 500, 10k, 2.5m, 1b",
         max_length=20,
         required=False,
     )
@@ -85,12 +86,6 @@ class ListingDetailsModal(discord.ui.Modal, title="Listing Details"):
         placeholder="e.g. diamonds, in-game currency, coins",
         max_length=30,
         default="in-game currency",
-        required=False,
-    )
-    image_url_input = discord.ui.TextInput(
-        label="Image URL (optional)",
-        placeholder="https://…",
-        max_length=500,
         required=False,
     )
 
@@ -105,10 +100,12 @@ class ListingDetailsModal(discord.ui.Modal, title="Listing Details"):
         price: float | None = None
         if price_raw:
             try:
-                price = float(price_raw.replace(",", ""))
+                price = parse_amount(price_raw)
             except ValueError:
                 await interaction.followup.send(
-                    embed=build_error_embed("Price must be a number (e.g. 500 or 12.50)."),
+                    embed=build_error_embed(
+                        "Price must be a number, optionally with a k/m/b suffix (e.g. 500, 10k, 2.5m, 1b)."
+                    ),
                     ephemeral=True,
                 )
                 return
@@ -117,7 +114,6 @@ class ListingDetailsModal(discord.ui.Modal, title="Listing Details"):
         self._wizard.description = self.description_input.value.strip()
         self._wizard.price = price
         self._wizard.currency_label = self.currency_input.value.strip() or "in-game currency"
-        self._wizard.image_url = self.image_url_input.value.strip() or None
 
         # Show confirmation embed
         preview = _build_preview_embed(self._wizard)
@@ -136,7 +132,7 @@ class ListingWizardState:
     __slots__ = (
         "scope", "category", "listing_type", "format",
         "mc_server_tag", "title", "description",
-        "price", "currency_label", "image_url",
+        "price", "currency_label",
         "guild_id", "seller_id",
         "auction_duration_hours",
     )
@@ -153,7 +149,6 @@ class ListingWizardState:
         self.description: str | None = None
         self.price: float | None = None
         self.currency_label: str = "in-game currency"
-        self.image_url: str | None = None
         self.auction_duration_hours: int = 24
 
 
@@ -171,8 +166,6 @@ def _build_preview_embed(wizard: ListingWizardState) -> discord.Embed:
         embed.add_field(name="MC Server", value=wizard.mc_server_tag, inline=True)
     price_str = f"{wizard.price} {wizard.currency_label}" if wizard.price else "*(not set)*"
     embed.add_field(name="Price", value=price_str, inline=True)
-    if wizard.image_url:
-        embed.set_image(url=wizard.image_url)
     return embed
 
 
@@ -391,7 +384,6 @@ async def _finalize_listing(interaction: discord.Interaction, wizard: ListingWiz
                 description=wizard.description,
                 price=wizard.price,
                 currency_label=wizard.currency_label,
-                image_url=wizard.image_url,
                 status="active",
                 auction_end_at=auction_end,
             )
@@ -777,6 +769,7 @@ class EditListingModal(discord.ui.Modal, title="Edit Listing"):
         )
         self.price_input = discord.ui.TextInput(
             label="Price",
+            placeholder="e.g. 500, 10k, 2.5m, 1b",
             default=str(listing.price) if listing.price else "",
             max_length=20,
             required=False,
@@ -790,9 +783,14 @@ class EditListingModal(discord.ui.Modal, title="Edit Listing"):
         price = None
         if self.price_input.value.strip():
             try:
-                price = float(self.price_input.value.strip())
+                price = parse_amount(self.price_input.value.strip())
             except ValueError:
-                await interaction.followup.send(embed=build_error_embed("Invalid price."), ephemeral=True)
+                await interaction.followup.send(
+                    embed=build_error_embed(
+                        "Invalid price. Use a number, optionally with a k/m/b suffix (e.g. 500, 10k, 2.5m, 1b)."
+                    ),
+                    ephemeral=True,
+                )
                 return
         async with AsyncSessionLocal() as session:
             async with session.begin():

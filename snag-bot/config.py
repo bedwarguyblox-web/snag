@@ -13,9 +13,11 @@ DEFAULT_EMBED_COLOR = 0x5865F2   # Discord blurple
 
 # Build invite URL from CLIENT_ID env var (never hardcode elsewhere)
 _CLIENT_ID = os.getenv("CLIENT_ID", "1525818030066761868")
-# Perms: Send Messages | Embed Links | Attach Files | Read Message History |
+# Perms: Send Messages | Embed Links | Read Message History |
 #         Use Slash Commands | Manage Messages
-_PERMISSIONS_INT = 275415026688
+# NOTE: Attach Files is intentionally excluded — listings never need the bot
+# to upload files, and granting it just adds an unused attack surface.
+_PERMISSIONS_INT = 275414993920
 INVITE_URL = (
     f"https://discord.com/api/oauth2/authorize"
     f"?client_id={_CLIENT_ID}&permissions={_PERMISSIONS_INT}&scope=bot%20applications.commands"

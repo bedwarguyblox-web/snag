@@ -134,6 +134,9 @@ class Listing(Base):
     description: Mapped[str] = mapped_column(String(1000))
     price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
     currency_label: Mapped[str] = mapped_column(String(30), default="in-game currency")
+    # Deprecated: listing image URLs are no longer collected or rendered
+    # (arbitrary user-supplied image URLs were an NSFW-spam vector). Column
+    # kept nullable for backward compatibility with existing rows only.
     image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(15), default="active")
     highest_bid: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
