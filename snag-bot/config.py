@@ -11,7 +11,7 @@ BOT_VERSION = "1.0.0"
 DEFAULT_EMBED_COLOR = 0x5865F2   # Discord blurple
 
 # Build invite URL from CLIENT_ID env var (never hardcode elsewhere)
-_CLIENT_ID = os.getenv("CLIENT_ID", "YOUR_CLIENT_ID_HERE")
+_CLIENT_ID = os.getenv("CLIENT_ID", "1525818030066761868")
 # Perms: Send Messages | Embed Links | Attach Files | Read Message History |
 #         Use Slash Commands | Manage Messages
 _PERMISSIONS_INT = 275415026688
