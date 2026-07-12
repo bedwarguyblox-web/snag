@@ -546,13 +546,20 @@ class FilterView(discord.ui.View):
     async def search_btn(self, interaction: discord.Interaction, _):
         await interaction.response.send_modal(SearchModal(self._filters))
 
-    @discord.ui.button(label="📋 Browse All", style=discord.ButtonStyle.secondary, custom_id="filter:browse_all", row=4)
-    async def browse_all(self, interaction: discord.Interaction, _):
+    @discord.ui.button(label="🏠 Server Listings", style=discord.ButtonStyle.secondary, custom_id="filter:server_listings", row=4)
+    async def server_listings(self, interaction: discord.Interaction, _):
         await interaction.response.defer(ephemeral=True)
+        self._filters["scope"] = "server"
+        await _run_listing_query(interaction, self._filters, guild_id=interaction.guild_id)
+
+    @discord.ui.button(label="🌐 Global Listings", style=discord.ButtonStyle.secondary, custom_id="filter:global_listings", row=4)
+    async def global_listings(self, interaction: discord.Interaction, _):
+        await interaction.response.defer(ephemeral=True)
+        self._filters["scope"] = "global"
         await _run_listing_query(interaction, self._filters)
 
 
-async def _run_listing_query(interaction: discord.Interaction, filters: dict):
+async def _run_listing_query(interaction: discord.Interaction, filters: dict, guild_id: int | None = None):
     conditions = [Listing.status == "active"]
 
     mc = filters.get("mc_server_tag")
@@ -570,6 +577,13 @@ async def _run_listing_query(interaction: discord.Interaction, filters: dict):
     fmt = filters.get("format")
     if fmt:
         conditions.append(Listing.format == fmt)
+
+    scope = filters.get("scope")
+    if scope:
+        conditions.append(Listing.scope == scope)
+        if scope == "server" and guild_id is not None:
+            # Server-scoped listings only show in the server they were posted in.
+            conditions.append(Listing.origin_guild_id == guild_id)
 
     search = filters.get("search")
 
@@ -676,7 +690,7 @@ async def start_check_listings(interaction: discord.Interaction):
     view = FilterView()
     embed = discord.Embed(
         title="🔍 Browse Listings",
-        description="Use the menus to filter, then click **Browse All** or **Search**.",
+        description="Use the menus to filter, then click **Server Listings**, **Global Listings**, or **Search**.",
         color=0x5865F2,
     )
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
