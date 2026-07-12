@@ -89,51 +89,60 @@ class ReviewModal(discord.ui.Modal, title="Rate Your Trade"):
 
         counts_toward_avg = pair_count < SAME_PAIR_REVIEW_CAP
 
-        async with AsyncSessionLocal() as session:
-            async with session.begin():
-                # Check for existing review on this deal (unique constraint guard)
-                existing = await session.execute(
-                    select(Review).where(
-                        Review.deal_id == self._deal_id,
-                        Review.reviewer_id == self._reviewer_id,
+        # Wrap the entire session block so IntegrityError propagates naturally out of
+        # session.begin()'s own __aexit__ (which correctly handles the rollback), and
+        # is caught here — outside — for the friendly user message.
+        # Catching inside session.begin() and calling session.rollback() manually was
+        # wrong: the context manager's __aexit__ still tried to commit a transaction
+        # we'd already rolled back, producing a secondary crash instead of the error msg.
+        try:
+            async with AsyncSessionLocal() as session:
+                async with session.begin():
+                    # SELECT guard: catches the normal double-click case before it hits the DB.
+                    existing = await session.execute(
+                        select(Review).where(
+                            Review.deal_id == self._deal_id,
+                            Review.reviewer_id == self._reviewer_id,
+                        )
                     )
-                )
-                if existing.scalar_one_or_none():
-                    await interaction.followup.send(
-                        embed=build_error_embed("You've already reviewed this deal."),
-                        ephemeral=True,
+                    if existing.scalar_one_or_none():
+                        await interaction.followup.send(
+                            embed=build_error_embed("You've already reviewed this deal."),
+                            ephemeral=True,
+                        )
+                        return
+
+                    review = Review(
+                        deal_id=self._deal_id,
+                        reviewer_id=self._reviewer_id,
+                        reviewee_id=self._reviewee_id,
+                        rating=rating,
+                        comment=comment,
+                        counts_toward_average=counts_toward_avg,
                     )
-                    return
+                    session.add(review)
+                    await session.flush()  # let IntegrityError propagate out of session.begin()
 
-                review = Review(
-                    deal_id=self._deal_id,
-                    reviewer_id=self._reviewer_id,
-                    reviewee_id=self._reviewee_id,
-                    rating=rating,
-                    comment=comment,
-                    counts_toward_average=counts_toward_avg,
-                )
-                session.add(review)
-                try:
-                    await session.flush()
-                except IntegrityError:
-                    await session.rollback()
-                    await interaction.followup.send(
-                        embed=build_error_embed("You've already submitted a review for this deal."),
-                        ephemeral=True,
-                    )
-                    return
+                    if counts_toward_avg:
+                        # Update reviewee's aggregate
+                        reviewee_profile = await get_or_create_profile(session, self._reviewee_id)
+                        reviewee_profile.global_rating_sum += rating
+                        reviewee_profile.global_rating_count += 1
 
-                if counts_toward_avg:
-                    # Update reviewee's aggregate
-                    reviewee_profile = await get_or_create_profile(session, self._reviewee_id)
-                    reviewee_profile.global_rating_sum += rating
-                    reviewee_profile.global_rating_count += 1
+                    # Clear pending_review_deal_id for the reviewer (only if it matches this deal)
+                    reviewer_profile = await get_or_create_profile(session, self._reviewer_id)
+                    if reviewer_profile.pending_review_deal_id == self._deal_id:
+                        reviewer_profile.pending_review_deal_id = None
 
-                # Clear pending_review_deal_id for the reviewer (only if it matches this deal)
-                reviewer_profile = await get_or_create_profile(session, self._reviewer_id)
-                if reviewer_profile.pending_review_deal_id == self._deal_id:
-                    reviewer_profile.pending_review_deal_id = None
+        except IntegrityError:
+            # Race condition: two simultaneous submissions both passed the SELECT check
+            # above before either committed.  session.begin().__aexit__ already rolled
+            # back cleanly; we just need to surface the friendly message.
+            await interaction.followup.send(
+                embed=build_error_embed("You've already submitted a review for this deal."),
+                ephemeral=True,
+            )
+            return
 
         cap_note = ""
         if not counts_toward_avg:

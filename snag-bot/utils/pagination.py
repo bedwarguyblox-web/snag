@@ -25,6 +25,13 @@ class PaginatorView(discord.ui.View):
         embed_items = items and isinstance(items[0], discord.Embed)
         self.per_page = 1 if embed_items else LISTINGS_PER_PAGE
         self.total_pages = max(1, (len(items) + self.per_page - 1) // self.per_page)
+        # Snapshot each embed's original footer text NOW, before current_page_embed()
+        # ever mutates it.  This prevents the "• N/M • N/M • N/M…" growth bug where
+        # revisiting a page appends another suffix to an already-mutated footer.
+        self._original_footers: list[str] = [
+            (item.footer.text or "") if isinstance(item, discord.Embed) else ""
+            for item in items
+        ]
         self._update_buttons()
 
     # ── helpers ──────────────────────────────────────────────────────────────
@@ -49,9 +56,10 @@ class PaginatorView(discord.ui.View):
         # server/rating fields are preserved.  Page counter goes in the footer.
         if isinstance(page_items[0], discord.Embed):
             embed = page_items[0]
-            # Append page info to existing footer text (build_listing_embed sets one)
-            existing_footer = embed.footer.text or ""
-            embed.set_footer(text=f"{existing_footer}  •  {self.page + 1}/{self.total_pages}")
+            # Always build footer from the ORIGINAL text snapshotted at init, not
+            # from embed.footer.text which may already carry a previous "• N/M" suffix.
+            original_footer = self._original_footers[start]
+            embed.set_footer(text=f"{original_footer}  •  {self.page + 1}/{self.total_pages}")
             return embed
 
         return discord.Embed(

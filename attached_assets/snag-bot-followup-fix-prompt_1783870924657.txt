@@ -1,0 +1,165 @@
+Snag Bot — Follow-Up Fix Prompt (2 new bugs found in review, 1 unresolved item)
+
+I reviewed the last round of fixes against the actual diff and simulated the
+tricky parts instead of just reading them. 5 of 7 fixes are solid: the
+Trusted Seller badge, the listing cooldown, global_feed_channel_id, hex
+validation, and the FK type fix all check out. Two of the fixes introduced
+or left behind real bugs, and one thing from the original crash still can't
+be confirmed fixed. Fix all three below.
+
+═══════════════════════════════════════════════════════════════════
+BUG A — Pagination footer grows every time a user revisits a page
+═══════════════════════════════════════════════════════════════════
+File: snag-bot/utils/pagination.py, PaginatorView.current_page_embed()
+(around lines 50-54)
+
+What's there now:
+    if isinstance(page_items[0], discord.Embed):
+        embed = page_items[0]
+        existing_footer = embed.footer.text or ""
+        embed.set_footer(text=f"{existing_footer}  •  {self.page + 1}/{self.total_pages}")
+        return embed
+
+Why it's broken: `self.items` is built once in __init__ and reused for the
+life of the view, so `page_items[0]` is the SAME Embed object every time a
+given page is rendered — not a fresh copy. `existing_footer` reads whatever
+is CURRENTLY in the footer, which on the second visit to a page is already
+the mutated value from the first visit. Each revisit appends another
+"  •  N/M" suffix instead of replacing it.
+
+I confirmed this by simulating Prev/Next clicks:
+  initial render (page 0): footer='Listing #1 • Active  •  1/3'
+  click Next -> page 1:    footer='Listing #2 • Active  •  2/3'
+  click Prev -> page 0:    footer='Listing #1 • Active  •  1/3  •  1/3'
+  click Next -> page 1:    footer='Listing #2 • Active  •  2/3  •  2/3'
+It keeps growing with every click on a previously-seen page for as long as
+the view is alive (up to its 120s timeout).
+
+Fix: don't derive the new footer from the embed's current (possibly already
+mutated) footer text. Capture each embed's ORIGINAL footer once, before any
+page-suffix is ever appended, and always build the displayed footer from
+that saved original — e.g. store `original_footer` per item the first time
+current_page_embed() touches it (or, cleaner, store the original footer
+text alongside each embed when the list is built in listings.py, so
+pagination.py never has to infer it from possibly-mutated state). The
+displayed footer should always be exactly "<original> • N/M", never
+"<original> • N/M • N/M • N/M...".
+
+Verification: build a PaginatorView with 2+ listing embeds, click Next then
+Prev then Next then Prev several times, and confirm the footer text is
+identical every time you land on the same page — it should never grow.
+
+═══════════════════════════════════════════════════════════════════
+BUG B — Review double-submit guard likely raises a different crash
+         instead of the friendly error it's supposed to show
+═══════════════════════════════════════════════════════════════════
+File: snag-bot/cogs/reviews.py, around lines 92-125
+
+What's there now:
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            ...
+            session.add(review)
+            try:
+                await session.flush()
+            except IntegrityError:
+                await session.rollback()
+                await interaction.followup.send(
+                    embed=build_error_embed("You've already submitted a review for this deal."),
+                    ephemeral=True,
+                )
+                return
+            ...
+
+Why this is likely still broken: `session.rollback()` is called manually
+INSIDE an active `async with session.begin():` block. That block's own
+__aexit__ still expects to own the commit/rollback of this transaction —
+when the `return` above causes the `with` block to exit normally (no
+exception propagating, since we already caught it), SQLAlchemy tries to
+commit a transaction that was already manually rolled back out from under
+it. Mixing manual session.rollback()/commit() with an active session.begin()
+context manager is a documented SQLAlchemy async pitfall and typically
+raises its own error at that point (transaction already closed / pending
+rollback), which would replace the friendly "already reviewed" message with
+an unhandled crash — in exactly the race-condition case this fix was
+written to catch.
+
+I was not able to install SQLAlchemy in my review sandbox to execute this
+end-to-end, so I can't give you a 100% confirmed stack trace — but the
+pattern itself is wrong regardless of the exact error text, and it should be
+fixed rather than left to find out in production.
+
+Fix: don't catch IntegrityError inside the session.begin() block at all.
+Let it propagate out of the block — session.begin()'s own exception path
+will correctly roll back — and catch it OUTSIDE, at the same level as the
+`async with AsyncSessionLocal()`:
+
+    try:
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                ...
+                session.add(review)
+                await session.flush()   # let IntegrityError propagate
+                ...
+    except IntegrityError:
+        await interaction.followup.send(
+            embed=build_error_embed("You've already submitted a review for this deal."),
+            ephemeral=True,
+        )
+        return
+
+Verification: this only triggers on the genuine race (two near-simultaneous
+submissions that both pass the earlier "existing review" SELECT check before
+either commits), so a normal manual double-click won't exercise it — the
+existing SELECT check catches that case first. To actually test the fix,
+simulate the race directly: open two sessions, insert two Review rows with
+the same (deal_id, reviewer_id) back-to-back without the SELECT guard in
+between (or add a short asyncio.sleep between the SELECT and the flush in a
+test copy of the code to widen the race window), and confirm the SECOND
+insert produces the friendly error message and NOT an unhandled exception in
+the logs.
+
+═══════════════════════════════════════════════════════════════════
+UNRESOLVED — Confirm the live database was actually migrated
+═══════════════════════════════════════════════════════════════════
+This isn't a new bug, it's an open question from the original crash fix
+that I cannot verify from a code export: snag.db is correctly gitignored,
+so it never shows up in a zip, and database/engine.py is byte-for-byte
+unchanged from before this round of fixes — no migration script, no schema
+version check.
+
+This matters more now than it did last time, because this round of fixes
+ADDED two more schema changes on top of the original listing_id PK issue:
+  - UserProfile.completed_deals (new column)
+  - Bid.listing_id / Deal.listing_id (BigInteger -> Integer)
+create_all() silently no-ops on all three if the live table already exists,
+regardless of what models.py says. If the live snag.db was never dropped or
+migrated, none of these three changes have actually taken effect yet, and
+the bot is still running against the old broken schema.
+
+Do this now, don't assume it from a code diff:
+1. Connect to the actual running Replit deployment (not a fresh local
+   checkout) and run:
+       PRAGMA table_info(listings);
+       PRAGMA table_info(user_profiles);
+       PRAGMA table_info(bids);
+       PRAGMA table_info(deals);
+   Confirm listings.listing_id is INTEGER, user_profiles has a
+   completed_deals column, and bids.listing_id / deals.listing_id are
+   INTEGER (not BIGINT).
+2. If any of those don't match, apply the migration now — following the
+   same rule as last time: back up snag.db first, and only do a blind
+   drop-and-recreate if the table has no real user data. If it has real
+   listings/deals/reviews, write a migration that rebuilds the affected
+   tables and copies existing rows across instead of dropping them.
+3. Actually create a listing end-to-end on the live deployment afterward
+   and confirm no NOT NULL / IntegrityError is thrown, exactly like the
+   original bug report.
+4. Add a memory entry (following the .agents/memory/ convention already
+   used in this repo) documenting whatever you find — even if the answer
+   is "confirmed the live DB was already migrated, no action needed" —
+   so this doesn't have to be re-verified blind next time.
+
+After fixing A and B and confirming the DB state in step above, give me a
+one-paragraph summary per item of what you found and changed, and flag
+anything you're still not fully certain about.
