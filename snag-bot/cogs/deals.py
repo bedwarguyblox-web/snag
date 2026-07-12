@@ -202,7 +202,10 @@ async def _create_deal(interaction: discord.Interaction, listing_id: int):
 
     # Get guild color
     config = guild_cache.get(interaction.guild_id)
-    color = int(config.embed_color.lstrip("#"), 16) if config else DEFAULT_EMBED_COLOR
+    try:
+        color = int((config.embed_color or "#5865F2").lstrip("#"), 16) if config else DEFAULT_EMBED_COLOR
+    except (ValueError, AttributeError):
+        color = DEFAULT_EMBED_COLOR
 
     deal_embed = build_deal_panel_embed(
         type("D", (), {"deal_id": deal_id, "status": "active"})(),

@@ -346,101 +346,142 @@ async def _finalize_listing_inner(
     guild_id: int,
 ):
     """Inner implementation — all exceptions propagate to _finalize_listing."""
-    async with AsyncSessionLocal() as session:
-        async with session.begin():
-            # Check active listing cap
-            count_result = await session.execute(
-                select(func.count()).where(
-                    Listing.seller_id == user_id,
-                    Listing.status == "active",
-                )
-            )
-            active_count = count_result.scalar_one()
-            if active_count >= MAX_ACTIVE_LISTINGS_PER_USER:
-                await interaction.followup.send(
-                    embed=build_error_embed(
-                        f"You've hit your active listing limit ({MAX_ACTIVE_LISTINGS_PER_USER}). "
-                        "Cancel or complete one first."
-                    ),
-                    ephemeral=True,
-                )
-                return
 
-            # Duplicate submission detection
-            cutoff = datetime.now(timezone.utc) - timedelta(seconds=DUPLICATE_LISTING_WINDOW_SECONDS)
-            dup_result = await session.execute(
-                select(Listing).where(
-                    Listing.seller_id == user_id,
-                    Listing.title == wizard.title,
-                    Listing.price == wizard.price,
-                    Listing.category == wizard.category,
-                    Listing.status == "active",
-                    Listing.created_at > cutoff,
-                )
-            )
-            if dup_result.scalar_one_or_none():
-                await interaction.followup.send(
-                    embed=build_error_embed(
-                        "A nearly identical listing was created in the last 10 minutes. "
-                        "Please wait before reposting."
-                    ),
-                    ephemeral=True,
-                )
-                return
-
-            # Ensure profile exists
-            profile = await get_or_create_profile(session, user_id)
-
-            auction_end = None
-            if wizard.format == "auction":
-                auction_end = datetime.now(timezone.utc) + timedelta(hours=wizard.auction_duration_hours)
-
-            listing = Listing(
-                seller_id=user_id,
-                origin_guild_id=guild_id,
-                scope=wizard.scope,
-                mc_server_tag=wizard.mc_server_tag,
-                category=wizard.category,
-                listing_type=wizard.listing_type,
-                format=wizard.format,
-                title=wizard.title,
-                description=wizard.description,
-                price=wizard.price,
-                currency_label=wizard.currency_label,
-                status="active",
-                auction_end_at=auction_end,
-            )
-            session.add(listing)
-            await session.flush()
-            listing_id = listing.listing_id
-
-    # Post embed to guild(s)
-    bot = interaction.client
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(Listing, UserProfile)
-            .join(UserProfile, UserProfile.user_id == Listing.seller_id)
-            .where(Listing.listing_id == listing_id)
+    # ── Phase 1: validate wizard state before touching DB ────────────────────
+    missing = [f for f in ("scope", "category", "listing_type", "format", "title") if not getattr(wizard, f)]
+    if missing:
+        logger.error("_finalize_listing: wizard missing fields %s for user %d", missing, user_id)
+        await interaction.followup.send(
+            embed=build_error_embed("Listing incomplete — please restart the wizard and fill in all steps."),
+            ephemeral=True,
         )
-        row = result.first()
+        return
+    if not wizard.description:
+        wizard.description = ""  # model allows empty string; guard against None
 
-    if not row:
-        await interaction.followup.send(embed=build_error_embed("Failed to retrieve listing."), ephemeral=True)
+    # ── Phase 2: DB write ────────────────────────────────────────────────────
+    logger.debug("_finalize_listing: writing DB row for user %d guild %d", user_id, guild_id)
+    listing_id: int | None = None
+    try:
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                # Active listing cap
+                count_result = await session.execute(
+                    select(func.count()).where(
+                        Listing.seller_id == user_id,
+                        Listing.status == "active",
+                    )
+                )
+                active_count = count_result.scalar_one()
+                if active_count >= MAX_ACTIVE_LISTINGS_PER_USER:
+                    await interaction.followup.send(
+                        embed=build_error_embed(
+                            f"You've hit your active listing limit ({MAX_ACTIVE_LISTINGS_PER_USER}). "
+                            "Cancel or complete one first."
+                        ),
+                        ephemeral=True,
+                    )
+                    return
+
+                # Duplicate detection
+                cutoff = datetime.now(timezone.utc) - timedelta(seconds=DUPLICATE_LISTING_WINDOW_SECONDS)
+                dup_result = await session.execute(
+                    select(Listing).where(
+                        Listing.seller_id == user_id,
+                        Listing.title == wizard.title,
+                        Listing.price == wizard.price,
+                        Listing.category == wizard.category,
+                        Listing.status == "active",
+                        Listing.created_at > cutoff,
+                    )
+                )
+                if dup_result.scalar_one_or_none():
+                    await interaction.followup.send(
+                        embed=build_error_embed(
+                            "A nearly identical listing was created in the last 10 minutes. "
+                            "Please wait before reposting."
+                        ),
+                        ephemeral=True,
+                    )
+                    return
+
+                # Ensure profile exists
+                await get_or_create_profile(session, user_id)
+
+                auction_end = None
+                if wizard.format == "auction":
+                    auction_end = datetime.now(timezone.utc) + timedelta(hours=wizard.auction_duration_hours)
+
+                listing = Listing(
+                    seller_id=user_id,
+                    origin_guild_id=guild_id,
+                    scope=wizard.scope,
+                    mc_server_tag=wizard.mc_server_tag,
+                    category=wizard.category,
+                    listing_type=wizard.listing_type,
+                    format=wizard.format,
+                    title=wizard.title,
+                    description=wizard.description,
+                    price=wizard.price,
+                    currency_label=wizard.currency_label,
+                    status="active",
+                    auction_end_at=auction_end,
+                )
+                session.add(listing)
+                await session.flush()
+                listing_id = listing.listing_id
+
+    except Exception:
+        logger.exception("_finalize_listing: DB write failed for user %d", user_id)
+        raise  # let outer handler show the error message
+
+    if not listing_id:
+        logger.error("_finalize_listing: listing_id is None after flush for user %d", user_id)
+        await interaction.followup.send(
+            embed=build_error_embed("Failed to save listing — please try again."),
+            ephemeral=True,
+        )
         return
 
-    db_listing, db_profile = row
-
-    if wizard.scope == "global":
-        await _broadcast_global_listing(bot, db_listing, db_profile, guild_id)
-    else:
-        await _post_listing_to_guild(bot, guild_id, db_listing, db_profile)
-
+    # ── Phase 3: tell the user it worked (listing is now saved) ─────────────
     await interaction.followup.send(
         embed=build_success_embed(
             f"✅ Listing **{wizard.title}** posted! (ID: #{listing_id})"
         ),
         ephemeral=True,
     )
+
+    # ── Phase 4: broadcast to channel(s) — best-effort, never crash confirm ─
+    bot = interaction.client
+
+    # Re-fetch listing + profile in a fresh session so attributes are loaded.
+    db_listing: Listing | None = None
+    db_profile: UserProfile | None = None
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Listing, UserProfile)
+                .join(UserProfile, UserProfile.user_id == Listing.seller_id)
+                .where(Listing.listing_id == listing_id)
+            )
+            row = result.first()
+        if row:
+            db_listing, db_profile = row
+    except Exception:
+        logger.exception("_finalize_listing: failed to re-fetch listing #%d for channel post", listing_id)
+
+    if db_listing and db_profile:
+        try:
+            if wizard.scope == "global":
+                await _broadcast_global_listing(bot, db_listing, db_profile, guild_id)
+            else:
+                await _post_listing_to_guild(bot, guild_id, db_listing, db_profile)
+        except Exception:
+            logger.exception(
+                "_finalize_listing: channel post failed for listing #%d (listing saved OK)", listing_id
+            )
+    else:
+        logger.warning("_finalize_listing: skipping channel post for listing #%d — row not found", listing_id)
 
 
 async def _post_listing_to_guild(bot, guild_id: int, listing: Listing, profile: UserProfile):
