@@ -469,7 +469,10 @@ async def _post_listing_to_guild(bot, guild_id: int, listing: Listing, profile: 
             )
             return
 
-    color = int(config.embed_color.lstrip("#"), 16)
+    try:
+        color = int((config.embed_color or "#5865F2").lstrip("#"), 16)
+    except ValueError:
+        color = 0x5865F2
     embed = build_listing_embed(listing, profile, guild_color=color)
 
     from cogs.deals import ListingActionView
