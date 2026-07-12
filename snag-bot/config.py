@@ -7,6 +7,7 @@ import os
 
 # ─── Bot identity ────────────────────────────────────────────────────────────
 BOT_NAME = "Snag"
+BOT_OWNER_ID: int = 1454352231494189121   # Only this user can run /owner commands
 BOT_VERSION = "1.0.0"
 DEFAULT_EMBED_COLOR = 0x5865F2   # Discord blurple
 

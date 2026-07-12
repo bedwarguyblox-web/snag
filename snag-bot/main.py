@@ -88,11 +88,23 @@ async def setup_hook() -> None:
     register_tasks(bot)
 
     # ── Sync slash commands ───────────────────────────────────────────────
+    # Global sync runs once so Discord knows the full command list.
+    # Per-guild sync runs for every guild the bot is currently in — this is
+    # instant and makes commands available immediately without waiting for
+    # Discord's global propagation delay (up to 1 hour).
     try:
         synced = await bot.tree.sync()
-        logger.info("Synced %d application command(s).", len(synced))
+        logger.info("Global sync: %d command(s).", len(synced))
     except Exception as exc:
-        logger.error("Failed to sync commands: %s", exc)
+        logger.error("Global sync failed: %s", exc)
+
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+        except Exception as exc:
+            logger.warning("Guild sync failed for %s (%s): %s", guild.name, guild.id, exc)
+    logger.info("Instant guild sync complete for %d server(s).", len(bot.guilds))
 
 
 async def _re_register_active_deal_views() -> None:

@@ -283,43 +283,6 @@ class OwnerCommands(commands.Cog):
             ephemeral=True,
         )
 
-    @owner_group.command(name="sync", description="[Owner only] Sync slash commands instantly")
-    @app_commands.describe(
-        scope="'guild' = instant sync to this server only | 'global' = sync everywhere (up to 1 hour)"
-    )
-    @app_commands.choices(scope=[
-        app_commands.Choice(name="guild  — instant, this server only", value="guild"),
-        app_commands.Choice(name="global — all servers (up to 1 hour)", value="global"),
-    ])
-    @bot_owner_only()
-    async def owner_sync(self, interaction: discord.Interaction, scope: str = "guild"):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            if scope == "guild":
-                # Copy global commands to this guild then sync — instant
-                interaction.client.tree.copy_global_to(guild=interaction.guild)
-                synced = await interaction.client.tree.sync(guild=interaction.guild)
-                await interaction.followup.send(
-                    embed=build_success_embed(
-                        f"Synced **{len(synced)} command(s)** to **this server** instantly. ✅"
-                    ),
-                    ephemeral=True,
-                )
-            else:
-                synced = await interaction.client.tree.sync()
-                await interaction.followup.send(
-                    embed=build_success_embed(
-                        f"Synced **{len(synced)} command(s)** globally. "
-                        f"May take up to 1 hour to appear everywhere."
-                    ),
-                    ephemeral=True,
-                )
-        except Exception as exc:
-            await interaction.followup.send(
-                embed=build_error_embed(f"Sync failed: {exc}"),
-                ephemeral=True,
-            )
-
     @owner_group.command(name="lookup", description="[Owner only] Full profile lookup by user ID")
     @app_commands.describe(user_id="Discord user ID")
     @bot_owner_only()

@@ -133,9 +133,10 @@ def admin_only():
 
 
 def bot_owner_only():
-    """app_commands check: discord.py's built-in owner check."""
+    """app_commands check: hardcoded owner ID — only BOT_OWNER_ID may run these."""
     async def predicate(interaction: discord.Interaction) -> bool:
-        if not await interaction.client.is_owner(interaction.user):
+        from config import BOT_OWNER_ID
+        if interaction.user.id != BOT_OWNER_ID:
             await interaction.response.send_message(
                 "This command is restricted to the bot owner.",
                 ephemeral=True,
