@@ -63,7 +63,7 @@ def build_listing_embed(listing, seller_profile=None, guild_color: int | None = 
     # Trusted badge (computed at render time, never stored)
     badge = ""
     if seller_profile:
-        completed = getattr(seller_profile, "_completed_deals", 0)
+        completed = getattr(seller_profile, "completed_deals", 0)
         avg = (
             seller_profile.global_rating_sum / seller_profile.global_rating_count
             if seller_profile.global_rating_count > 0

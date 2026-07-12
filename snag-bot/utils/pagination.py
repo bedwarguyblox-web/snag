@@ -20,7 +20,10 @@ class PaginatorView(discord.ui.View):
         super().__init__(timeout=timeout)
         self.items = items
         self.page = 0
-        self.per_page = LISTINGS_PER_PAGE
+        # When items are full listing embeds, show one per page so all fields
+        # (price, category, server, rating) are visible — not just a truncated description.
+        embed_items = items and isinstance(items[0], discord.Embed)
+        self.per_page = 1 if embed_items else LISTINGS_PER_PAGE
         self.total_pages = max(1, (len(items) + self.per_page - 1) // self.per_page)
         self._update_buttons()
 
@@ -42,20 +45,13 @@ class PaginatorView(discord.ui.View):
                 color=discord.Color.greyple(),
             )
 
-        # If items are already full embeds, return the first one with page info
+        # Items are full listing embeds — return them directly so price/category/
+        # server/rating fields are preserved.  Page counter goes in the footer.
         if isinstance(page_items[0], discord.Embed):
-            embed = discord.Embed(
-                title=f"📋 Listings — Page {self.page + 1}/{self.total_pages}",
-                color=0x5865F2,
-            )
-            for item_embed in page_items:
-                embed.add_field(
-                    name=item_embed.title or "Listing",
-                    value=(item_embed.description or "")[:200] + "…"
-                    if len(item_embed.description or "") > 200
-                    else (item_embed.description or ""),
-                    inline=False,
-                )
+            embed = page_items[0]
+            # Append page info to existing footer text (build_listing_embed sets one)
+            existing_footer = embed.footer.text or ""
+            embed.set_footer(text=f"{existing_footer}  •  {self.page + 1}/{self.total_pages}")
             return embed
 
         return discord.Embed(

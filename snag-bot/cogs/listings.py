@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 
 import discord
@@ -35,6 +36,10 @@ from utils.pagination import PaginatorView
 from utils.parsing import parse_amount
 
 logger = logging.getLogger(__name__)
+
+# In-memory per-user listing creation cooldown: {user_id: last_create_timestamp}
+# NOTE: resets on restart; fine for a single-process bot, but won't work across shards.
+_listing_create_cooldowns: dict[int, float] = {}
 
 
 # ─── IGN Modal ───────────────────────────────────────────────────────────────
@@ -365,6 +370,20 @@ async def _finalize_listing_inner(
     try:
         async with AsyncSessionLocal() as session:
             async with session.begin():
+                # Listing creation cooldown (in-memory; resets on restart)
+                now_mono = time.monotonic()
+                last_create = _listing_create_cooldowns.get(user_id, 0)
+                if now_mono - last_create < LISTING_CREATE_COOLDOWN_SECONDS:
+                    remaining = int(LISTING_CREATE_COOLDOWN_SECONDS - (now_mono - last_create))
+                    await interaction.followup.send(
+                        embed=build_error_embed(
+                            f"You're creating listings too quickly. "
+                            f"Please wait **{remaining}s** before posting another."
+                        ),
+                        ephemeral=True,
+                    )
+                    return
+
                 # Active listing cap
                 count_result = await session.execute(
                     select(func.count()).where(
@@ -442,6 +461,10 @@ async def _finalize_listing_inner(
             ephemeral=True,
         )
         return
+
+    # Cooldown timestamp set only after a successful DB write, so a failed/rejected
+    # attempt doesn't burn the user's cooldown window.
+    _listing_create_cooldowns[user_id] = time.monotonic()
 
     # ── Phase 3: tell the user it worked (listing is now saved) ─────────────
     await interaction.followup.send(

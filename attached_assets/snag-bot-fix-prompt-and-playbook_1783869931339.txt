@@ -1,0 +1,257 @@
+# Snag Bot — Fix Prompt for Replit + Prevention Playbook
+
+Two parts here:
+
+1. **A ready-to-paste prompt** for Replit's agent that fixes all 7 confirmed bugs, in the right order, with the destructive step guarded.
+2. **A prevention playbook** — why these specific bugs happened, and concrete habits/techniques (agent-specific and general) to keep them from recurring.
+
+I cross-checked every bug against your actual code (not just the report) before writing this, and found one thing worth flagging up front: **the "Trusted Seller" bug is worse than it looks.** It's not just that nothing sets `_completed_deals` — there is no `completed_deals` column on `UserProfile` at all. It's a schema gap, not a logic gap, which means it has to be fixed alongside the migration in bug #1, not as a standalone code patch.
+
+---
+
+## Part 1 — Prompt to paste into Replit
+
+```
+Fix the following 7 confirmed bugs in this codebase. Go in this exact order —
+bugs #1, #7, and the schema part of #6-adjacent completed_deals field all
+touch the database schema, so they need to be bundled into ONE migration
+pass, not three separate ones.
+
+═══════════════════════════════════════════════════════════════════
+STEP 0 — BEFORE TOUCHING THE DATABASE
+═══════════════════════════════════════════════════════════════════
+Check whether snag-bot/database/snag.db currently contains any real listings,
+bids, deals, or user profiles (not just test data). Tell me what you find
+before doing anything destructive.
+
+- If it's empty or test-only: back it up anyway (`cp snag.db snag.db.bak`),
+  then it's fine to drop and let create_all_tables() regenerate it.
+- If it has real data: do NOT drop the table. Instead write a proper
+  migration that recreates `listings` with the corrected schema and copies
+  existing rows across, converting any bad rows if needed. Do not lose data
+  to fix a bug.
+
+═══════════════════════════════════════════════════════════════════
+STEP 1 — Fix the crash + bundle the other schema changes into it
+═══════════════════════════════════════════════════════════════════
+Root cause: database/models.py already declares
+`listing_id: Mapped[int] = mapped_column(Integer, primary_key=True,
+autoincrement=True)` correctly, but database/engine.py's create_all_tables()
+only runs Base.metadata.create_all(), which never alters an existing table —
+it just checks if the table exists and skips it. The live snag.db still has
+the old BigInteger-PK `listings` table from before the model was fixed, so
+every insert still fails.
+
+While you're touching this table, also make these two schema changes in the
+SAME pass, since they require the same kind of table rebuild:
+
+  a) Add a `completed_deals` column to UserProfile in database/models.py:
+     `completed_deals: Mapped[int] = mapped_column(Integer, default=0)`
+     This column does not currently exist anywhere in the schema — it's not
+     just an unset attribute, there's genuinely nowhere to store the count.
+
+  b) Fix the FK/PK type mismatch: Listing.listing_id is Integer, but
+     Bid.listing_id and Deal.listing_id (both declared BigInteger) are
+     foreign keys pointing at it. Change both to Integer to match.
+
+After making these model changes, actually apply them to the live database
+(via the migration path decided in Step 0), not just to models.py.
+
+Longer term: this project has no real migration tool — create_all() silently
+no-ops on existing tables, which is exactly how the original bug shipped and
+went unnoticed. Set up Alembic (or at minimum a simple versioned migration
+runner) so future schema changes don't rely on someone remembering to
+manually drop tables. Add this as a follow-up task if you don't have time to
+do it in this pass — don't skip mentioning it.
+
+═══════════════════════════════════════════════════════════════════
+STEP 2 — Wire up completed_deals so the Trusted Seller badge can fire
+═══════════════════════════════════════════════════════════════════
+In cogs/deals.py, inside `mark_complete_btn`, in the `if both_confirmed:`
+block (where pending_review_deal_id is set on both profiles), increment
+`profile.completed_deals += 1` for both the initiator and seller profiles.
+
+In utils/embeds.py, change:
+    completed = getattr(seller_profile, "_completed_deals", 0)
+to read the real column:
+    completed = seller_profile.completed_deals
+Keep a safe default (e.g. `getattr(seller_profile, "completed_deals", 0)`)
+only if there's any code path where seller_profile could be a partial/mock
+object — otherwise a direct attribute access is preferable so a future
+rename fails loudly instead of silently returning 0 again.
+
+═══════════════════════════════════════════════════════════════════
+STEP 3 — Implement the missing listing-creation cooldown
+═══════════════════════════════════════════════════════════════════
+config.py already defines LISTING_CREATE_COOLDOWN_SECONDS = 300 and
+listings.py imports it, but nothing ever checks it. Implement it using the
+same in-memory pattern bidding.py already uses for BID_COOLDOWN_SECONDS
+(the `_bid_cooldowns` dict keyed by (user_id, listing_id) around line 35 of
+cogs/bidding.py) — mirror that pattern with a module-level
+`_listing_create_cooldowns: dict[int, float]` keyed by user_id in
+cogs/listings.py.
+
+Add the check in `_finalize_listing`, before the active-listing-cap check
+(around line 369, before `count_result = await session.execute(...)`), so a
+user on cooldown gets rejected before any DB work happens. Set/update the
+cooldown timestamp only after the listing is successfully created — mirror
+where bidding.py updates `_bid_cooldowns` after a successful bid (around
+line 83), so a failed/duplicate-rejected attempt doesn't burn the user's
+cooldown window.
+
+Note for later: like the existing bid cooldown, this is in-memory, so it
+resets on restart and won't work if this bot ever runs as multiple
+processes/shards. That's consistent with the existing pattern, so it's fine
+to ship as-is, but flag it as a known limitation in a code comment.
+
+═══════════════════════════════════════════════════════════════════
+STEP 4 — Decide the fate of global_feed_channel_id
+═══════════════════════════════════════════════════════════════════
+This column exists and cogs/listings.py already reads it
+(`config.global_feed_channel_id or config.panel_channel_id`), but nothing
+ever sets it. Pick one:
+  a) Implement it: add a setup command/button in cogs/admin_setup.py that
+     lets an admin set a dedicated global-feed channel, following the same
+     pattern as the existing "Toggle Global Listings" button.
+  b) Remove it: delete the column and the fallback branch in listings.py if
+     it's not actually planned as a near-term feature, so the code doesn't
+     imply a feature exists that doesn't.
+Tell me which you chose and why. Don't leave it half-built silently — that's
+the exact state it's in now.
+
+═══════════════════════════════════════════════════════════════════
+STEP 5 — Fix hex color validation (input AND every consumption site)
+═══════════════════════════════════════════════════════════════════
+CustomHexModal.on_submit in cogs/admin_setup.py only checks the value starts
+with "#" and has length 4 or 7 — it never checks the characters are valid
+hex digits, so e.g. "#GGGGGG" saves successfully. Fix the validation itself,
+e.g.:
+    import re
+    if not re.fullmatch(r"#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})", value):
+        # reject
+
+Separately — and do this even after fixing the modal — wrap the two
+unguarded parse sites in a try/except, since guilds may already have a bad
+value saved before this fix ships:
+  - cogs/admin_setup.py line ~287, inside `preferences()`
+  - cogs/admin_setup.py line ~363, inside `_do_send_panel()`
+Match the guard pattern already used elsewhere in the codebase (see
+cogs/listings.py line ~514 and cogs/deals.py line ~206, both of which
+already wrap this exact `int(color.lstrip("#"), 16)` call in
+try/except ValueError with a fallback to the default color). Use the same
+fallback constant, DEFAULT_EMBED_COLOR from config.py, in all four places
+for consistency.
+
+═══════════════════════════════════════════════════════════════════
+STEP 6 — Fix Browse/Search results losing most listing info
+═══════════════════════════════════════════════════════════════════
+PaginatorView.current_page_embed() in utils/pagination.py takes full listing
+embeds and keeps only title + a 200-char snippet of the description,
+discarding price, category, MC server, seller rating, etc. Rework this so
+paginated results show the same key fields as a freshly posted listing embed
+— either:
+  a) Show one full listing embed per page (set LISTINGS_PER_PAGE = 1 in
+     config.py and return page_items[0] directly instead of rebuilding a
+     summary embed), or
+  b) Keep multiple listings per page but copy over the actual embed.fields
+     (price/category/server/rating) instead of just embed.description, so
+     the same data survives, just in a more compact layout.
+Pick whichever better matches the UX we already have elsewhere and tell me
+which you chose.
+
+═══════════════════════════════════════════════════════════════════
+STEP 7 — Guard the review race condition
+═══════════════════════════════════════════════════════════════════
+cogs/reviews.py already imports IntegrityError (from the UniqueConstraint on
+(deal_id, reviewer_id)) but never catches it. Wrap the review insert in
+try/except IntegrityError, roll back the session, and send the user a
+friendly "you've already submitted a review for this deal" message instead
+of letting the exception surface.
+
+═══════════════════════════════════════════════════════════════════
+VERIFICATION — do this before telling me it's done
+═══════════════════════════════════════════════════════════════════
+For each bug above, do a quick concrete check, not just "the code looks
+right":
+1. Actually create a listing end-to-end against the migrated DB and confirm
+   a listing_id gets assigned (no NOT NULL / IntegrityError).
+2. Complete a test deal between two profiles 10 times (or seed
+   completed_deals directly) and confirm the Trusted Seller badge appears
+   once the threshold is hit.
+3. Try to create two listings back-to-back as the same user within 5 minutes
+   and confirm the second is rejected with a cooldown message.
+4. Submit "#GGGGGG" and "#ZZZ" to the hex modal and confirm both are
+   rejected at the modal, and that /setup preferences + panel send don't
+   crash even if a guild already has a bad color saved (simulate by writing
+   an invalid value directly via a debug session).
+5. Open /Check Listings with 2+ listings and confirm price/category/server/
+   rating are visible on the results, not just a truncated description.
+6. Submit two reviews for the same deal back to back (simulate the race if
+   needed) and confirm the second gets a clean error instead of a crash.
+
+Write a one-paragraph summary of what changed per bug, and call out anything
+you're NOT fully confident about (e.g. "I implemented the cooldown but
+didn't test the multi-shard case since this bot doesn't shard yet").
+
+If this repo's .agents/memory/ convention (see MEMORY.md and
+sqlite-autoincrement-pk.md) is how you log lessons learned, add a new memory
+entry for the "create_all() doesn't migrate existing tables" lesson and for
+"config/model fields need a confirmed write path before they're trusted to
+work" — both bit us today and should be single-line-linked from MEMORY.md
+like the existing entry.
+```
+
+---
+
+## Part 2 — Why these bugs happened, and how to stop the pattern
+
+Looking across all 7, they split into three repeating failure modes — not seven unrelated mistakes:
+
+- **Schema drift**: the model file says one thing, the live database says another, and nothing checks that they agree. (#1, and secretly #6's `completed_deals` gap)
+- **Write path never built, read path assumes it exists**: something reads a flag/column/counter that nothing ever sets. (#1's badge, #3)
+- **A safety pattern exists in one file but wasn't copied to its siblings**: cooldowns, try/except guards. (#2, #4)
+
+Fixing the seven bugs doesn't fix the pattern. Here's what does, roughly in order of leverage.
+
+### 1. Give schema changes a real migration path
+`create_all()` only creates *missing* tables — it will never fix a column type, add a column to an existing table, or backfill data. That "safe on every startup" comment in `engine.py` is true and misleading at the same time: safe, but silently does nothing when you actually needed a change to take effect. This is the single highest-leverage fix here, because it caused bug #1 and would've silently swallowed the `completed_deals` column too if it had been added without a real migration.
+
+- Adopt **Alembic** even for a small SQLite project — it turns "did the fix actually apply" from a question you find out about via a bug report into something `alembic upgrade head` either does or fails loudly on.
+- If Alembic is overkill for now, at minimum add a tiny **schema version check at startup**: compare `PRAGMA table_info(table)` against `Base.metadata` for each table and log a hard `ERROR` (not silence) if they've diverged. That alone would have turned this bug into a startup log message instead of a runtime crash discovered by a user.
+- Treat "delete the db and let it regenerate" as a **dev-only escape hatch**, never a fix you ship instructions for without first asking whether the target database has real data. (I built that check into Step 0 of the prompt above for exactly this reason.)
+
+### 2. Every "flag" needs a traced write path before you trust it
+`_completed_deals` and `global_feed_channel_id` are the same bug shape: a value is read somewhere, formatted nicely, gated behind a threshold or an `or` fallback — and looks completely implemented. Nothing about reading the code at the call site tells you it's dead; you only find out by tracing backward to see if anything ever *writes* it.
+
+A cheap habit that catches this class of bug specifically:
+- When you (or an agent) finish a feature that reads a model field or config value, explicitly grep for every place that *sets* it. If the answer is "nowhere else," that's your signal — either wire it up now or leave a `# TODO: no write path yet` comment so it doesn't quietly ship as "done."
+- Periodically ask an agent to do exactly what generated your bug report: **"trace every flag and config field end-to-end from write path to read path and tell me which ones are read but never written."** That's a genuinely good recurring audit, not a one-time cleanup — worth doing again after a few weeks of new features, not just once.
+
+### 3. When you add a guard in one place, grep for its siblings
+The hex-color bug happened because `listings.py` and `deals.py` both correctly wrap `int(color, 16)` in try/except, but `admin_setup.py` — which does the exact same parse, twice — doesn't. The safe pattern already existed in the codebase; it just wasn't propagated everywhere the same operation happens.
+
+- Whenever you (or an agent) add a `try/except`, a cooldown, a validation check, or any other guard, grep the repo for other call sites doing the *same kind of operation* (not just the same function name) and confirm they're consistent. `int(*.lstrip("#"), 16)` is a good example — a plain function-name search wouldn't have caught the inconsistency, but a search for that literal pattern would.
+- **Validate at the boundary, defend at every consumption site.** Fixing the modal stops *new* bad values, but guilds that already saved `#GGGGGG` before the fix would still crash `preferences()` and panel sending. Defense in depth — validate on input, and never let a raw unchecked string reach `int(..., 16)` — is why Step 5 above fixes both.
+
+### 4. Test the failure mode, not just the happy path
+None of these bugs would've survived a couple of targeted tests:
+- An insert-and-fetch test on `Listing` would have caught the PK bug immediately, in CI, instead of in production.
+- A fuzz test on the hex modal with `"#GGGGGG"`, `"####"`, `""`, `"red"` would have caught the validation gap in seconds.
+- A "create two listings within 5 minutes" test would have caught the missing cooldown.
+
+You don't need a huge suite — a handful of tests aimed specifically at "what's the worst plausible input/timing here" catches most of what a broad manual read-through misses. If Replit supports a "Run tests" step, wire pytest into it so agent-written code gets checked mechanically before you're the one who finds the bug in production.
+
+### 5. Use (and grow) the memory file this repo already has
+You already have `.agents/memory/MEMORY.md` and a `sqlite-autoincrement-pk.md` entry documenting the exact PK-type lesson from earlier — that's a good pattern, and it's underused. The `create_all()`-doesn't-migrate lesson and the "config fields need a confirmed write path" lesson from this pass belong in there too (I added that as the last instruction in the Step-0 block of the prompt above). The value of this isn't just documentation — it's that a future agent session, or a future you, gets to start from "we already know not to do this" instead of rediscovering it by shipping the same bug shape again.
+
+### 6. A short checklist for reviewing any agent-generated diff going forward
+Whether it's Replit, Claude, or anyone else writing the code:
+
+- **New model field or column?** → Does it ship with a migration, or does it silently rely on `create_all`?
+- **New config value or flag?** → Is there a confirmed call site that writes it, not just one that reads it?
+- **New guard/validation/cooldown?** → Did you grep for every sibling call site doing the same kind of operation?
+- **New try/except added?** → Does the *matching* operation elsewhere in the codebase have the same guard?
+- **Destructive fix suggested** (drop table, delete file, reset state)? → Has anyone confirmed there's no real data at stake first?
+- **"It's implemented" claim** → Was it actually exercised end-to-end (real insert, real render, real failure case), or does it just read cleanly?
+
+None of this is specific to Discord bots or SQLite — it's the same handful of questions worth asking of any AI-assisted change, since the bugs an agent introduces tend to look like exactly this: locally correct code that's globally inconsistent with a sibling file, or with the live state of a database it can't see.

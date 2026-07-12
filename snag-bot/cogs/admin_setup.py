@@ -5,6 +5,8 @@ Only usable by members with Manage Guild permission or the guild's configured ad
 
 from __future__ import annotations
 
+import re
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -13,6 +15,7 @@ from sqlalchemy import select
 import utils.cache as guild_cache
 from database.engine import AsyncSessionLocal
 from database.models import GuildConfig
+from config import DEFAULT_EMBED_COLOR
 from utils.checks import admin_only, is_admin
 from utils.embeds import build_success_embed, build_error_embed
 
@@ -49,9 +52,9 @@ class CustomHexModal(discord.ui.Modal, title="Set Custom Embed Color"):
 
     async def on_submit(self, interaction: discord.Interaction):
         value = self.hex_input.value.strip()
-        if not value.startswith("#") or len(value) not in (4, 7):
+        if not re.fullmatch(r"#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})", value):
             await interaction.response.send_message(
-                embed=build_error_embed("Invalid hex color. Use format #RRGGBB or #RGB."),
+                embed=build_error_embed("Invalid hex color. Use format #RRGGBB or #RGB with valid hex digits (0-9, A-F)."),
                 ephemeral=True,
             )
             return
@@ -115,6 +118,43 @@ class SetLogChannelModal(discord.ui.Modal, title="Set Log Channel ID"):
             embed=build_success_embed(f"Log channel set to <#{cid}>."),
             ephemeral=True,
         )
+
+
+class SetGlobalFeedChannelModal(discord.ui.Modal, title="Set Global Feed Channel ID"):
+    channel_id_input = discord.ui.TextInput(
+        label="Global Feed Channel ID",
+        placeholder="Paste the channel snowflake ID (or 0 to clear)",
+        max_length=20,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.channel_id_input.value.strip()
+        try:
+            cid = int(raw)
+        except ValueError:
+            await interaction.response.send_message(
+                embed=build_error_embed("That doesn't look like a valid channel ID."),
+                ephemeral=True,
+            )
+            return
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                config = await _get_or_create_config(interaction.guild_id, session)
+                config.global_feed_channel_id = cid if cid != 0 else None
+        guild_cache.invalidate(interaction.guild_id)
+        if cid == 0:
+            await interaction.response.send_message(
+                embed=build_success_embed("Global feed channel cleared."),
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                embed=build_success_embed(
+                    f"Global feed channel set to <#{cid}>.\n"
+                    f"Global listings will now be broadcast here instead of the panel channel."
+                ),
+                ephemeral=True,
+            )
 
 
 class SetAdminRoleModal(discord.ui.Modal, title="Set Admin Role ID"):
@@ -247,6 +287,15 @@ class SetupView(discord.ui.View):
         await interaction.response.send_modal(SetLogChannelModal())
 
     @discord.ui.button(
+        label="Set Global Feed Channel",
+        style=discord.ButtonStyle.secondary,
+        custom_id="setup:global_feed_channel",
+        row=4,
+    )
+    async def set_global_feed_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SetGlobalFeedChannelModal())
+
+    @discord.ui.button(
         label="Set Admin Role",
         style=discord.ButtonStyle.secondary,
         custom_id="setup:admin_role",
@@ -274,6 +323,10 @@ class AdminSetup(commands.Cog):
                 config = await _get_or_create_config(interaction.guild_id, session)
                 guild_cache.set(config)
 
+        try:
+            embed_color_int = int(config.embed_color.lstrip("#"), 16)
+        except (ValueError, AttributeError):
+            embed_color_int = DEFAULT_EMBED_COLOR
         embed = discord.Embed(
             title="⚙️ Snag — Server Preferences",
             description=(
@@ -282,9 +335,10 @@ class AdminSetup(commands.Cog):
                 f"**Server Listings:** {'✅ Enabled' if config.allow_server_listings else '❌ Disabled'}\n"
                 f"**Custom Categories:** {', '.join(config.custom_categories) or '*(none)*'}\n"
                 f"**Log Channel:** {'<#' + str(config.log_channel_id) + '>' if config.log_channel_id else '*(not set)*'}\n"
+                f"**Global Feed Channel:** {'<#' + str(config.global_feed_channel_id) + '>' if config.global_feed_channel_id else '*(not set)*'}\n"
                 f"**Admin Role:** {'<@&' + str(config.admin_role_id) + '>' if config.admin_role_id else '*(not set)*'}"
             ),
-            color=int(config.embed_color.lstrip("#"), 16),
+            color=embed_color_int,
         )
 
         await interaction.followup.send(embed=embed, view=SetupView(config), ephemeral=True)
@@ -360,7 +414,10 @@ async def _do_send_panel(interaction: discord.Interaction, channel: discord.Text
             select(GuildConfig).where(GuildConfig.guild_id == interaction.guild_id)
         )
         config = result.scalar_one_or_none()
-    color = int(config.embed_color.lstrip("#"), 16) if config else 0x5865F2
+    try:
+        color = int(config.embed_color.lstrip("#"), 16) if config else DEFAULT_EMBED_COLOR
+    except (ValueError, AttributeError):
+        color = DEFAULT_EMBED_COLOR
 
     embed = discord.Embed(
         title="🛒 Snag Marketplace",

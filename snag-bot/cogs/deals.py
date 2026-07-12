@@ -335,10 +335,11 @@ class DealPanelView(discord.ui.View):
                     if listing:
                         listing.status = "completed"
 
-                    # Set pending review on both parties
+                    # Set pending review on both parties and increment completed deal counts
                     for uid in (initiator_id, seller_id):
                         profile = await get_or_create_profile(session, uid)
                         profile.pending_review_deal_id = deal_id
+                        profile.completed_deals += 1
 
         if both_confirmed:
             bot = interaction.client

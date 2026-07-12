@@ -71,6 +71,7 @@ class UserProfile(Base):
         ForeignKey("deals.deal_id"),
         nullable=True,
     )
+    completed_deals: Mapped[int] = mapped_column(Integer, default=0)
     timeout_count: Mapped[int] = mapped_column(Integer, default=0)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
     ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -162,7 +163,7 @@ class Bid(Base):
 
     bid_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     listing_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("listings.listing_id")
+        Integer, ForeignKey("listings.listing_id")
     )
     bidder_id: Mapped[int] = mapped_column(BigInteger)
     amount: Mapped[float] = mapped_column(Numeric(12, 2))
@@ -183,7 +184,7 @@ class Deal(Base):
 
     deal_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     listing_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("listings.listing_id")
+        Integer, ForeignKey("listings.listing_id")
     )
     initiator_id: Mapped[int] = mapped_column(BigInteger)
     seller_id: Mapped[int] = mapped_column(BigInteger)

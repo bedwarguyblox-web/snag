@@ -114,6 +114,15 @@ class ReviewModal(discord.ui.Modal, title="Rate Your Trade"):
                     counts_toward_average=counts_toward_avg,
                 )
                 session.add(review)
+                try:
+                    await session.flush()
+                except IntegrityError:
+                    await session.rollback()
+                    await interaction.followup.send(
+                        embed=build_error_embed("You've already submitted a review for this deal."),
+                        ephemeral=True,
+                    )
+                    return
 
                 if counts_toward_avg:
                     # Update reviewee's aggregate
