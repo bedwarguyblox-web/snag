@@ -1,0 +1,1 @@
+- [SQLite autoincrement PK type](sqlite-autoincrement-pk.md) — SQLAlchemy PKs must be `Integer`, not `BigInteger`/`BigInteger`-derived, for SQLite auto-assign to work at all.

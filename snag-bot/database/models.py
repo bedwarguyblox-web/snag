@@ -120,7 +120,9 @@ class Listing(Base):
         Index("ix_listings_seller_id", "seller_id"),
     )
 
-    listing_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: primary key must be plain Integer (not BigInteger) so SQLite treats
+    # it as a rowid alias and actually auto-assigns a value on insert.
+    listing_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     seller_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("user_profiles.user_id")
     )
@@ -158,7 +160,7 @@ class Bid(Base):
         Index("ix_bids_listing_id", "listing_id"),
     )
 
-    bid_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    bid_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     listing_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("listings.listing_id")
     )
@@ -179,7 +181,7 @@ class Deal(Base):
         Index("ix_deals_status_last_activity", "status", "last_activity_at"),
     )
 
-    deal_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    deal_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     listing_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("listings.listing_id")
     )
@@ -214,7 +216,7 @@ class Review(Base):
         Index("ix_reviews_pair", "reviewer_id", "reviewee_id"),
     )
 
-    review_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    review_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     deal_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("deals.deal_id"))
     reviewer_id: Mapped[int] = mapped_column(BigInteger)
     reviewee_id: Mapped[int] = mapped_column(BigInteger)
@@ -234,7 +236,7 @@ class Report(Base):
         Index("ix_reports_reported_user_id", "reported_user_id"),
     )
 
-    report_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    report_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     deal_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("deals.deal_id"), nullable=True
     )
