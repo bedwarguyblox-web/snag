@@ -44,25 +44,37 @@ class ListingActionView(discord.ui.View):
         custom_id="listing:start_deal:0",  # overridden in __init__
     )
     async def start_deal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        # Resolve listing_id from custom_id
+        # Resolve listing_id and action from custom_id BEFORE deciding how to respond.
+        # Modals MUST be opened via interaction.response.send_modal() — you cannot
+        # open a modal after calling response.defer().  So we check the action first.
         parts = button.custom_id.split(":")
         listing_id = int(parts[2])
         action = parts[1]
 
         if action == "place_bid":
-            await _launch_bid_modal(interaction, listing_id)
+            # For auctions: open the bid modal directly (no defer allowed before send_modal)
+            await _open_bid_modal(interaction, listing_id)
         else:
+            # For direct sales: defer then create the deal
+            await interaction.response.defer(ephemeral=True)
             await _create_deal(interaction, listing_id)
 
 
-async def _launch_bid_modal(interaction: discord.Interaction, listing_id: int):
+async def _open_bid_modal(interaction: discord.Interaction, listing_id: int):
+    """Fetch listing data and open the bid modal directly (no prior defer)."""
     from cogs.bidding import PlaceBidModal
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Listing).where(Listing.listing_id == listing_id))
         listing = result.scalar_one_or_none()
     if not listing:
-        await interaction.followup.send(embed=build_error_embed("Listing not found."), ephemeral=True)
+        await interaction.response.send_message(
+            embed=build_error_embed("Listing not found."), ephemeral=True
+        )
+        return
+    if listing.status != "active" or listing.format != "auction":
+        await interaction.response.send_message(
+            embed=build_error_embed("This auction is no longer accepting bids."), ephemeral=True
+        )
         return
     modal = PlaceBidModal(
         listing_id=listing_id,
@@ -70,46 +82,7 @@ async def _launch_bid_modal(interaction: discord.Interaction, listing_id: int):
         currency=listing.currency_label,
         guild_id=interaction.guild_id,
     )
-    await interaction.followup.send(
-        content="Opening bid modal…", ephemeral=True
-    )
-    # Can't send modal after defer; inform user to click the button fresh
-    await interaction.followup.send(
-        embed=discord.Embed(
-            description="Click the **Place Bid** button on the listing embed (not deferred) to open the bid form.",
-            color=0x5865F2,
-        ),
-        ephemeral=True,
-    )
-
-
-# ─── Direct-bid button that properly opens a modal ────────────────────────────
-
-class BidButtonView(discord.ui.View):
-    """Non-persistent bid button that opens a modal directly (no defer)."""
-
-    def __init__(self, listing_id: int, current_bid, currency: str, guild_id: int):
-        super().__init__(timeout=None)
-        self._listing_id = listing_id
-        self._current_bid = current_bid
-        self._currency = currency
-        self._guild_id = guild_id
-        self.bid_btn.custom_id = f"bid:modal:{listing_id}"
-
-    @discord.ui.button(
-        label="🔨 Place Bid",
-        style=discord.ButtonStyle.primary,
-        custom_id="bid:modal:0",
-    )
-    async def bid_btn(self, interaction: discord.Interaction, _):
-        from cogs.bidding import PlaceBidModal
-        modal = PlaceBidModal(
-            listing_id=self._listing_id,
-            current_bid=self._current_bid,
-            currency=self._currency,
-            guild_id=self._guild_id,
-        )
-        await interaction.response.send_modal(modal)
+    await interaction.response.send_modal(modal)
 
 
 # ─── Deal creation ────────────────────────────────────────────────────────────

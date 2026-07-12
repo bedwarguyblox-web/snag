@@ -323,6 +323,29 @@ async def _finalize_listing(interaction: discord.Interaction, wizard: ListingWiz
     user_id = interaction.user.id
     guild_id = interaction.guild_id
 
+    try:
+        await _finalize_listing_inner(interaction, wizard, user_id, guild_id)
+    except Exception as exc:
+        logger.exception("Unhandled error in _finalize_listing for user %d: %s", user_id, exc)
+        try:
+            await interaction.followup.send(
+                embed=build_error_embed(
+                    "An unexpected error occurred while posting your listing. "
+                    "Please try again or contact a server admin."
+                ),
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+
+
+async def _finalize_listing_inner(
+    interaction: discord.Interaction,
+    wizard: ListingWizardState,
+    user_id: int,
+    guild_id: int,
+):
+    """Inner implementation — all exceptions propagate to _finalize_listing."""
     async with AsyncSessionLocal() as session:
         async with session.begin():
             # Check active listing cap
@@ -430,12 +453,21 @@ async def _post_listing_to_guild(bot, guild_id: int, listing: Listing, profile: 
                 guild_cache.set(config)
 
     if not config or not config.panel_channel_id:
+        logger.warning("_post_listing_to_guild: guild %d has no panel_channel_id configured", guild_id)
         return
 
     channel_id = config.global_feed_channel_id or config.panel_channel_id
     channel = bot.get_channel(channel_id)
     if not channel:
-        return
+        # Channel not in local cache — fetch from Discord API
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning(
+                "_post_listing_to_guild: could not fetch channel %d for guild %d: %s",
+                channel_id, guild_id, exc,
+            )
+            return
 
     color = int(config.embed_color.lstrip("#"), 16)
     embed = build_listing_embed(listing, profile, guild_color=color)
@@ -457,10 +489,7 @@ async def _broadcast_global_listing(bot, listing: Listing, profile: UserProfile,
         configs = result.scalars().all()
 
     for config in configs:
-        if config.guild_id == origin_guild_id:
-            await _post_listing_to_guild(bot, config.guild_id, listing, profile)
-        else:
-            await _post_listing_to_guild(bot, config.guild_id, listing, profile)
+        await _post_listing_to_guild(bot, config.guild_id, listing, profile)
         await asyncio.sleep(GLOBAL_BROADCAST_DELAY)
 
 
@@ -724,7 +753,6 @@ class Listings(commands.Cog):
             await interaction.followup.send(embed=build_error_embed("Only active listings can be edited."), ephemeral=True)
             return
 
-        modal = EditListingModal(listing)
         await interaction.followup.send(
             embed=build_listing_embed(listing),
             view=_EditListingLaunchView(listing),
