@@ -68,7 +68,7 @@ class UserProfile(Base):
     global_rating_count: Mapped[int] = mapped_column(Integer, default=0)
     pending_review_deal_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey("deals.deal_id", use_alter=True, name="fk_user_pending_deal"),
+        ForeignKey("deals.deal_id"),
         nullable=True,
     )
     timeout_count: Mapped[int] = mapped_column(Integer, default=0)

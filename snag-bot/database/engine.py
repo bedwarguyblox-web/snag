@@ -1,11 +1,16 @@
 """
-Async SQLAlchemy engine + session factory.
-One pooled engine for the entire process — never create engines inside command handlers.
+Async SQLAlchemy engine + session factory — SQLite backend.
+
+The database file (snag.db) is created automatically in the same directory as
+this file if it does not already exist.  SQLAlchemy's create_all() is fully
+idempotent — it checks for each table before issuing CREATE TABLE, so running
+it on an existing database is always safe.
 """
 
-import os
 import asyncio
 import logging
+import os
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -13,45 +18,23 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.exc import OperationalError
-
-from config import DB_POOL_SIZE, DB_MAX_OVERFLOW
 
 logger = logging.getLogger(__name__)
 
-# Build the asyncpg DSN from DATABASE_URL (Replit provides this as a pg:// URL)
-def _build_dsn() -> str:
-    url = os.environ["DATABASE_URL"]
-    # Normalise scheme so asyncpg driver is used regardless of the source host
-    # (Replit provides postgres://, Neon/Supabase/Railway provide postgresql://)
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif url.startswith("postgresql://") and "+asyncpg" not in url:
-        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    # Strip ?sslmode=require from the DSN string — asyncpg handles SSL via
-    # connect_args instead; leaving it in the URL causes a parse error.
-    if "?sslmode=" in url:
-        url = url.split("?sslmode=")[0]
-    return url
+# Place snag.db next to this file (i.e. inside snag-bot/database/)
+_DB_PATH = Path(__file__).parent / "snag.db"
+_DB_URL = f"sqlite+aiosqlite:///{_DB_PATH}"
 
-
-def _ssl_args() -> dict:
-    """Return connect_args that enable SSL when the original URL requests it."""
-    raw = os.environ.get("DATABASE_URL", "")
-    if "sslmode=require" in raw or "neon.tech" in raw or "supabase" in raw:
-        import ssl
-        ctx = ssl.create_default_context()
-        return {"ssl": ctx}
-    return {}
-
-
+# StaticPool keeps a single connection open and reuses it — correct for SQLite
+# in an async single-process bot.  check_same_thread=False is required for
+# SQLite when the same connection is accessed from multiple coroutines.
 engine: AsyncEngine = create_async_engine(
-    _build_dsn(),
-    pool_size=DB_POOL_SIZE,
-    max_overflow=DB_MAX_OVERFLOW,
-    pool_pre_ping=True,          # detect dead connections and replace them
+    _DB_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
     echo=False,
-    connect_args=_ssl_args(),    # enables SSL for Neon/Supabase/Railway etc.
 )
 
 AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
@@ -63,25 +46,30 @@ AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
 
 
 async def create_all_tables() -> None:
-    """Create all tables defined in models (idempotent via CREATE IF NOT EXISTS)."""
-    from database.models import Base  # local import to avoid circular at module load
+    """
+    Create every table defined in models.py if it does not already exist.
+    Safe to call on every startup — existing tables and data are never touched.
+    """
+    from database.models import Base  # local import avoids circular at module load
 
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
             async with engine.begin() as conn:
+                # Enable WAL mode for better concurrent read/write performance
+                await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+                # Enforce foreign key constraints (off by default in SQLite)
+                await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
                 await conn.run_sync(Base.metadata.create_all)
-            logger.info("Database tables ready.")
+            if _DB_PATH.exists():
+                logger.info("Database ready at %s", _DB_PATH)
             return
         except OperationalError as exc:
             if attempt == max_attempts:
                 raise
             wait = 2 ** attempt
             logger.warning(
-                "DB connection attempt %d/%d failed (%s). Retrying in %ds…",
-                attempt,
-                max_attempts,
-                exc,
-                wait,
+                "DB attempt %d/%d failed (%s). Retrying in %ds…",
+                attempt, max_attempts, exc, wait,
             )
             await asyncio.sleep(wait)

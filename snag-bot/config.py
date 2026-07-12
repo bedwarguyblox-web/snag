@@ -91,9 +91,5 @@ SAME_PAIR_REVIEW_CAP: int = 3
 TRUSTED_BADGE_MIN_COMPLETED_DEALS: int = 10
 TRUSTED_BADGE_MIN_AVG_RATING: float = 4.5
 
-# DB pool settings
-DB_POOL_SIZE: int = 5
-DB_MAX_OVERFLOW: int = 10
-
 # Duplicate listing detection window (seconds)
 DUPLICATE_LISTING_WINDOW_SECONDS: int = 600      # 10 minutes
