@@ -1,0 +1,365 @@
+# BUILD PROMPT — "Snag" Global Cross-Server Discord Marketplace Bot
+
+> Paste this entire document into Replit Agent as your first message for a new Repl.
+> Everything in this document is a hard requirement unless marked "OPTIONAL."
+> Do not simplify, skip, or substitute technologies without flagging it to me first.
+
+## 0. Project Summary
+
+Build a Discord bot named **Snag** (placeholder name — keep configurable in one constant) whose core purpose is a **trading marketplace** primarily for Minecraft SMP communities (Donut SMP is the flagship server), installed across many Discord servers ("guilds"). Each guild admin configures their own panel; listings can stay local to one guild ("server-scoped") or broadcast across every guild the bot is in ("global-scoped"). All actual trade negotiation happens in **DMs**, one active deal per user at a time, with a mandatory post-deal review system.
+
+---
+
+## 1. Architecture Setup (mandatory — do not deviate)
+
+**Language/Framework: Python 3.11+ with discord.py 2.4+ (or newer stable release). Do NOT use Node.js/discord.js, and do NOT mix in any TypeScript/JS tooling.** Pick this stack and commit to it for the entire project — no partial rewrites in another language later.
+
+**Database: PostgreSQL, accessed via SQLAlchemy 2.0 (async) + asyncpg.** Use Replit's built-in PostgreSQL database (the `DATABASE_URL` environment variable Replit provisions). Do NOT use Replit's key-value DB, flat JSON files, or SQLite for persistent state — this bot is cross-server and needs relational integrity and concurrent-write safety.
+
+**Required project structure — create exactly this layout:**
+
+```
+/
+├── main.py                 # entrypoint: bot init, intents, load all cogs, setup_hook, run()
+├── config.py                # constants: bot name, default embed color, preset global
+│                             #   categories, preset "server filter" list (Donut SMP,
+│                             #   Hypixel, top 5 popular servers, etc.), invite perms int,
+│                             #   AND all abuse/performance limits from sections 4 & 7
+│                             #   (cooldowns, bid increments, anti-snipe, storage caps)
+├── database/
+│   ├── __init__.py
+│   ├── engine.py            # async engine + async_sessionmaker, connection retry logic
+│   └── models.py            # ALL SQLAlchemy models (schema in section 2)
+├── cogs/
+│   ├── admin_setup.py       # /setup command tree: preferences editor + /panel send
+│   ├── panel_views.py       # persistent View classes for the 3 main panel buttons
+│   ├── listings.py          # create-listing wizard, embed builder, filter/search UI
+│   ├── deals.py             # deal creation, DM deal-panel, dual-confirm completion
+│   ├── bidding.py           # Place Bid flow, anti-snipe, bid validation (section 3.6)
+│   ├── reviews.py           # rating modal + "must review before new deal" gate
+│   └── moderation.py        # guild-scoped bans (admin), global ban (bot owner only),
+│                             #   reports table, /moderation lookup_user, /stats
+├── utils/
+│   ├── embeds.py            # shared embed builder — MUST include invite branding line
+│   ├── checks.py            # decorators: is_admin(), is_bot_owner(), no_active_deal(),
+│   │                         #   not_pending_review(), is_guild_banned(), is_globally_banned()
+│   ├── cache.py             # in-memory guild_config cache (section 7 performance)
+│   └── pagination.py        # reusable paginator View for listing results
+├── background_tasks.py      # tasks.loop jobs: deal timeout sweep, auction-end sweep,
+│                             #   listing-expiry sweep, weekly archive sweep (section 7)
+├── requirements.txt
+└── .env                     # DISCORD_TOKEN, DATABASE_URL, CLIENT_ID (git-ignored)
+```
+
+**Bot setup requirements:**
+- Use `commands.Bot` (not `AutoShardedBot` yet — see section 6, sharding).
+- Required intents: `guilds`, `guild_messages`, `members` (privileged — must be enabled in the Discord Developer Portal), `message_content` only if needed for legacy prefix commands (prefer slash commands/components entirely and skip this intent if unused).
+- Register **all persistent Views** (the 3-button main panel, every listing's action view, every DM deal panel) inside `setup_hook()` using `bot.add_view(...)` BEFORE `on_ready` fires, with a fixed `custom_id` on every component. **This is mandatory** — without it, every button stops working the moment the bot restarts.
+- Build the invite URL from `CLIENT_ID` + a permissions integer computed from: Send Messages, Embed Links, Attach Files, Read Message History, Use Slash Commands, Manage Messages (to edit its own panel). Store this as `INVITE_URL` in `config.py` and never hardcode it elsewhere.
+- All Discord API calls and DB calls must be `async`/non-blocking. Never use blocking `requests` or a synchronous DB driver anywhere — a single blocking call stalls the entire event loop for every guild the bot is in simultaneously.
+
+---
+
+## 2. Precise Database Schema
+
+Implement these exact tables as SQLAlchemy models. Field names and types below are final — do not rename or retype them, since every cog depends on this schema.
+
+### `guild_configs`
+| Column | Type | Notes |
+|---|---|---|
+| `guild_id` | `BigInteger`, PK | Discord snowflake |
+| `embed_color` | `String(7)` | hex, default `"#5865F2"` |
+| `allow_global_listings` | `Boolean` | default `True` |
+| `allow_server_listings` | `Boolean` | default `True` |
+| `custom_categories` | `JSON` (list[str]) | admin-defined categories for server-scoped listings; default `[]` |
+| `panel_channel_id` | `BigInteger`, nullable | |
+| `panel_message_id` | `BigInteger`, nullable | |
+| `admin_role_id` | `BigInteger`, nullable | extra role beyond `Manage Guild` perm |
+| `log_channel_id` | `BigInteger`, nullable | reports/mod actions |
+| `created_at` / `updated_at` | `DateTime(timezone=True)` | |
+
+### `user_profiles`
+| Column | Type | Notes |
+|---|---|---|
+| `user_id` | `BigInteger`, PK | |
+| `ign` | `String(32)`, nullable | in-game name, set via "My IGN" button — always display as **self-reported/unverified**, never as verified identity (section 4, impersonation) |
+| `global_rating_sum` | `Integer`, default `0` | |
+| `global_rating_count` | `Integer`, default `0` | avg = sum/count, computed at read time, never stored |
+| `pending_review_deal_id` | `BigInteger`, `ForeignKey("deals.deal_id")`, nullable | set when a deal of theirs completes; cleared when they submit the review |
+| `timeout_count` | `Integer`, default `0` | incremented for BOTH parties whenever a deal they were in ends via the 48h timeout sweep (section 3.7); this is visibility only, not auto-punitive — see section 4 |
+| `is_banned` | `Boolean`, default `False` | **global** marketplace ban — settable ONLY by the bot owner (see 3.10), never by a guild admin |
+| `ban_reason` | `Text`, nullable | |
+| `created_at` | `DateTime(timezone=True)` | |
+
+### `guild_bans`
+| Column | Type | Notes |
+|---|---|---|
+| `guild_id` | `BigInteger`, `ForeignKey("guild_configs.guild_id")` | part of composite PK |
+| `user_id` | `BigInteger` | part of composite PK |
+| `reason` | `Text`, nullable | |
+| `banned_by` | `BigInteger` | the admin who issued it |
+| `created_at` | `DateTime(timezone=True)` | |
+| Composite PK `(guild_id, user_id)` | | one row per banned user per guild — this is the admin-level ban, scoped to a single server only, and is a completely separate mechanism from `user_profiles.is_banned` |
+
+### `listings`
+| Column | Type | Notes |
+|---|---|---|
+| `listing_id` | `BigInteger`, PK, autoincrement | |
+| `seller_id` | `BigInteger`, `ForeignKey("user_profiles.user_id")` | |
+| `origin_guild_id` | `BigInteger` | Discord server it was created in |
+| `scope` | `String(10)` | CHECK IN `('server','global')` |
+| `mc_server_tag` | `String(50)`, nullable | which Minecraft server the item/service is FROM — Donut SMP, Hypixel, etc. (this is the "server filter", distinct from `origin_guild_id`) |
+| `category` | `String(50)` | preset (`bases`,`items`,`service`, ...) or custom string for server-scoped |
+| `listing_type` | `String(10)` | CHECK IN `('buying','selling')` |
+| `format` | `String(15)` | CHECK IN `('direct_sale','auction')` — "auction" = bidding |
+| `title` | `String(100)` | |
+| `description` | `String(1000)` | **hard-capped at 1000 chars via the Modal's `max_length`** — bounds row size and keeps embeds render-cheap (section 7) |
+| `price` | `Numeric(12,2)`, nullable | fixed price, or auction starting bid |
+| `currency_label` | `String(30)`, default `"in-game currency"` | free text since MC economies vary |
+| `image_url` | `Text`, nullable | |
+| `status` | `String(15)` | CHECK IN `('active','pending_deal','completed','cancelled','expired')` |
+| `highest_bid` | `Numeric(12,2)`, nullable | auction only |
+| `highest_bidder_id` | `BigInteger`, nullable | auction only |
+| `auction_end_at` | `DateTime(timezone=True)`, nullable | auction only |
+| `auction_extension_count` | `Integer`, default `0` | anti-snipe extensions used so far — capped, see 3.6 |
+| `created_at` | `DateTime(timezone=True)` | |
+| `expires_at` | `DateTime(timezone=True)` | default `created_at + 14 days` |
+
+### `bids` (auction format only)
+| Column | Type | Notes |
+|---|---|---|
+| `bid_id` | `BigInteger`, PK, autoincrement | |
+| `listing_id` | `BigInteger`, `ForeignKey("listings.listing_id")` | |
+| `bidder_id` | `BigInteger` | |
+| `amount` | `Numeric(12,2)` | |
+| `created_at` | `DateTime(timezone=True)` | |
+
+Full bid history is retained per listing (capped — section 4/7) as the audit trail for shill-bidding or bid-dispute investigations.
+
+### `deals`
+| Column | Type | Notes |
+|---|---|---|
+| `deal_id` | `BigInteger`, PK, autoincrement | |
+| `listing_id` | `BigInteger`, `ForeignKey("listings.listing_id")` | |
+| `initiator_id` | `BigInteger` | buyer, or winning bidder |
+| `seller_id` | `BigInteger` | |
+| `status` | `String(15)` | CHECK IN `('active','completed','cancelled','expired')` |
+| `initiator_confirmed` | `Boolean`, default `False` | dual-confirm gate, see 3.7 |
+| `seller_confirmed` | `Boolean`, default `False` | |
+| `dm_message_id_initiator` | `BigInteger`, nullable | the persistent deal-panel message in initiator's DM |
+| `dm_message_id_seller` | `BigInteger`, nullable | |
+| `last_activity_at` | `DateTime(timezone=True)` | updated on every button click/message in either DM |
+| `created_at` | `DateTime(timezone=True)` | |
+| `ended_at` | `DateTime(timezone=True)`, nullable | |
+| `end_reason` | `String(25)`, nullable | `'completed' \| 'cancelled_by_initiator' \| 'cancelled_by_seller' \| 'timeout'` |
+
+### `reviews`
+| Column | Type | Notes |
+|---|---|---|
+| `review_id` | `BigInteger`, PK, autoincrement | |
+| `deal_id` | `BigInteger`, `ForeignKey("deals.deal_id")` | |
+| `reviewer_id` | `BigInteger` | |
+| `reviewee_id` | `BigInteger` | |
+| `rating` | `SmallInteger` | CHECK `1 <= rating <= 5` |
+| `comment` | `String(500)`, nullable | |
+| `counts_toward_average` | `Boolean`, default `True` | see section 4 (rating-farming/collusion mitigation) — set `False` past the same-pair review cap |
+| `created_at` | `DateTime(timezone=True)` | |
+| Unique constraint on `(deal_id, reviewer_id)` | | one review per person per deal |
+
+### `reports` (NEW — persistent abuse trail, section 4)
+| Column | Type | Notes |
+|---|---|---|
+| `report_id` | `BigInteger`, PK, autoincrement | |
+| `deal_id` | `BigInteger`, `ForeignKey("deals.deal_id")`, nullable | |
+| `reporter_id` | `BigInteger` | |
+| `reported_user_id` | `BigInteger` | |
+| `reason` | `Text` | from the Report Issue modal |
+| `guild_id` | `BigInteger` | which guild's log channel it was routed to |
+| `status` | `String(15)` | CHECK IN `('open','reviewed','dismissed')`, default `'open'` |
+| `created_at` | `DateTime(timezone=True)` | |
+
+### Required indexes (section 7 — do not skip these)
+- `listings`: composite index on `(status, scope)`; composite index on `(mc_server_tag, category, listing_type, format)` for the filter/search query; index on `seller_id`.
+- `deals`: composite index on `(status, last_activity_at)` — the 48h timeout sweep filters on exactly this pair.
+- `bids`: index on `listing_id`.
+- `reviews`: index on `reviewee_id`; index on `(reviewer_id, reviewee_id)` for the same-pair cap check.
+- `reports`: index on `reported_user_id`.
+
+---
+
+## 3. Chained Workflow Steps
+
+Build and test in this exact order. Do not jump ahead to bidding/deals/reviews before listings work end to end.
+
+### 3.1 Admin preference setup — `/setup`
+1. Guard: only usable by members with `Manage Guild` permission or the guild's configured `admin_role_id`.
+2. Opens an ephemeral message with a `View` containing: a color picker (Select menu of preset hex colors + a "custom hex" button that opens a `Modal`), a toggle for `allow_server_listings` / `allow_global_listings`, and a "Manage Categories" button that opens a `Modal` for comma-separated custom category names (stored to `custom_categories`).
+3. Every change immediately upserts the guild's row in `guild_configs` **and invalidates that guild's entry in the in-memory config cache** (section 7).
+4. This command must be runnable and re-runnable at any time, independent of whether the panel has been sent yet.
+
+### 3.2 Sending the permanent panel — `/panel send`
+1. Guard: same admin check as 3.1.
+2. **Before sending**, check the bot has `Send Messages` + `Embed Links` in the target channel; if missing, respond ephemeral with a clear error, do not attempt the send.
+3. Build the panel embed using the guild's configured color, and attach the persistent 3-button `View` (Create Listing / Check Listings / My IGN).
+4. Send it, then store `panel_channel_id` and `panel_message_id` on `guild_configs`.
+5. If a panel already exists for this guild, ask for confirmation before sending a duplicate.
+
+### 3.3 Create Listing wizard (button → chained Selects/Modals)
+1. Click **Create Listing** → guard: reject if `is_globally_banned(user_id)` or `is_guild_banned(guild_id, user_id)` (section 3.10), reject if the user already has `MAX_ACTIVE_LISTINGS_PER_USER` (config constant, default `10`) active listings ("You've hit your active listing limit — cancel or complete one first."), otherwise continue.
+2. Ephemeral Select: "Server-scoped" or "Global" (grey out whichever is disabled in `guild_configs`).
+3. **Hold all wizard-in-progress answers in memory on the View/session object — do not write anything to `listings` until the final confirm step.** This avoids orphaned partial rows from abandoned wizards (section 7).
+4. Scope drives category source: server-scoped → Select built from that guild's `custom_categories`; global → Select from preset categories (`Bases`, `Items`, `Service`, + any others you think fit this theme, e.g. `Ranks/Currency`, `Builds`).
+5. Select: Buying or Selling.
+6. Select: Direct Sale or Auction/Bidding.
+7. Modal: title, description (**`max_length=1000`**), price (or starting bid), currency label, optional image URL.
+8. Reject duplicate submissions: if the same seller already has an active listing with identical `title` + `price` + `category` created in the last 10 minutes, block it as a likely double-submit/spam duplicate.
+9. Confirmation embed preview with Confirm/Cancel buttons.
+10. On confirm: insert the `listings` row, post the listing embed (with the invite branding line, section 3.9) either to that guild's panel-adjacent listings channel (server-scoped) or to every guild's designated global-listings feed (global-scoped — you'll need a `global_feed_channel_id` per guild you post into; reuse `panel_channel_id` if no separate feed channel exists, with a small delay between sends per guild — section 7), and attach a persistent listing-action `View` with "Start Deal" / "Place Bid" depending on format.
+11. Apply `LISTING_CREATE_COOLDOWN_SECONDS` (config constant, default `300`) as an **in-memory** per-user cooldown via `app_commands.checks.cooldown()` — do not implement this as a DB timestamp check (section 7).
+
+### 3.4 Check Listings / filter + search flow
+1. Click **Check Listings** → ephemeral filter panel with, in this order: (a) Server filter — Select of preset top MC servers (Donut SMP, Hypixel, + top 5 popular servers you configure) plus "Any"; (b) Category filter; (c) Buying/Selling filter; (d) Direct Sale/Auction filter; (e) a "Search" button that opens a `Modal` text box matched against listing `title`/`description` (case-insensitive `ILIKE`).
+2. All filters are optional/combinable; "Any"/blank = no constraint on that field.
+3. Run the filtered query against `listings` where `status = 'active'`, apply a hard `LIMIT 200` at the query level before pagination (so a broad "Any/Any/Any" filter on a large global table never pulls unbounded rows), then paginate 5 results per page using the shared paginator util, each result as a compact embed field with a "View Listing" button that opens the full listing embed + its action buttons.
+
+### 3.5 My IGN
+1. Click **My IGN** → `Modal` with current IGN pre-filled if set → upsert `user_profiles.ign`. Anywhere the IGN is displayed (listings, profile lookups), label it clearly as self-reported (e.g. "IGN: Steve123 *(self-reported)*") — never present it as a verified identity (section 4, impersonation).
+
+### 3.6 Auction bidding flow (Place Bid) — NEW, build this before the deal system
+1. Click **Place Bid** on an active `auction`-format listing → `Modal`: bid amount (numeric input).
+2. Validate in this exact order, rejecting with a clear ephemeral message at the first failure:
+   - (a) listing `status != 'active'`, `format != 'auction'`, or `auction_end_at` already passed → "This auction has ended."
+   - (b) `bidder_id == seller_id` → "You can't bid on your own listing." (self-bid prevention)
+   - (c) bidder is globally banned, or guild-banned for the listing's `origin_guild_id` (section 3.10)
+   - (d) bid amount must exceed the current `highest_bid` (or `price` if no bids yet) by at least `MIN_BID_INCREMENT_PERCENT` (config constant, default `5%`, with an absolute minimum floor, e.g. `1` unit) — if it doesn't, reject and tell the user the exact minimum qualifying amount.
+   - (e) per-user, per-listing bid cooldown of `BID_COOLDOWN_SECONDS` (config constant, default `10`), enforced **in-memory**, to stop rapid bid-mashing.
+   - (f) if the listing has already reached `MAX_BIDS_PER_LISTING` (config constant, default `200`), reject further bids with "This auction has reached its bid limit" rather than letting a bidding war grow the table unbounded (section 7).
+3. Apply the bid with the same atomic conditional-update pattern used for listing claims — never read-then-write: `UPDATE listings SET highest_bid=:amt, highest_bidder_id=:uid WHERE listing_id=:id AND status='active' AND (highest_bid IS NULL OR highest_bid < :amt) RETURNING *`, checking rowcount, so two simultaneous bids can't both believe they won.
+4. Insert a `bids` row regardless, for the permanent audit trail (shill-bidding/dispute investigation, section 4).
+5. **Anti-snipe protection**: if the accepted bid lands within `ANTI_SNIPE_WINDOW_SECONDS` (config constant, default `120`) of `auction_end_at`, extend `auction_end_at` by `ANTI_SNIPE_EXTENSION_SECONDS` (config constant, default `120`) and increment `auction_extension_count`. Stop extending once `auction_extension_count` reaches `MAX_AUCTION_EXTENSIONS` (config constant, default `5`) so a sustained bidding war can't keep an auction open indefinitely.
+6. OPTIONAL: notify the previous highest bidder they've been outbid (DM or embed edit) — gate behind a per-user opt-in preference to avoid DM-spam complaints.
+7. On auction end (background sweep, section 6): auto-create the deal with the current `highest_bidder_id`, running it through the same gates as 3.7 step 2. If the winning bidder fails a gate at resolution time (e.g. banned mid-auction), fall back to the next-highest bid in `bids` rather than silently dropping the auction; if no valid bidder remains, mark the listing `expired`.
+
+### 3.7 Deal system (DM-based, one active deal per user)
+1. User clicks "Start Deal" (direct sale) or wins an auction (auto-triggered by the background task in section 6 when `auction_end_at` passes, per 3.6 step 7).
+2. **Before creating the deal, in order:** (a) reject if `listing.status != 'active'` ("This listing is no longer available."); (b) reject if either party is globally banned (`user_profiles.is_banned`), OR if either party has a `guild_bans` row for the listing's `origin_guild_id` — a guild-scoped ban only blocks activity tied to that specific guild, see 3.10; (c) reject if either party already has a `deals` row with `status='active'` ("You're already in the middle of a deal."); (d) reject if either party has a non-null `pending_review_deal_id` ("Deal cannot be created — you haven't rated the other person from your last deal yet."); (e) reject self-deals (`initiator_id == seller_id`).
+3. Use an atomic `UPDATE listings SET status='pending_deal' WHERE listing_id=:id AND status='active'` (checking rowcount) to prevent two buyers claiming the same listing in a race condition — do not do a separate SELECT-then-UPDATE.
+4. Insert the `deals` row, then DM both parties an embed "deal panel" with persistent buttons: **Mark Complete**, **Cancel Deal**, **Report Issue**. Store each DM's message ID on the deal row. Include a standing disclaimer line in the deal panel embed: "Snag does not guarantee any transaction — never send real-world payment info, and use Report Issue if something feels wrong." (section 4, scam mitigation).
+5. Every button click on either DM panel updates `last_activity_at`.
+6. Every deal-panel button callback must verify `interaction.user.id` is actually `initiator_id` or `seller_id` **on that specific `deal_id`** before acting — never trust the button's `custom_id` alone for authorization (section 4, interaction spoofing).
+7. **Completion requires both sides**: clicking Mark Complete sets that side's `*_confirmed = True`; once both are `True`, set `deals.status='completed'`, `listings.status='completed'`, set both users' `pending_review_deal_id` to this deal, and DM both a review prompt (3.8).
+8. Either side clicking Cancel Deal immediately ends the deal (`status='cancelled'`, `end_reason` reflects who cancelled), reopens the listing (`status='active'`) unless the listing was an auction that already ended, and does NOT require a review.
+9. Report Issue → `Modal` for a reason, insert a row into `reports` (section 2) and post the embed to `guild_configs.log_channel_id` for the listing's `origin_guild_id`.
+
+### 3.8 Mandatory review system
+1. On deal completion, DM both parties a `Modal`-triggering button: "Rate this trade."
+2. Modal: 1–5 star Select (or number input) + optional comment (`max_length=500`).
+3. On submit: check how many prior reviews exist for this exact `(reviewer_id, reviewee_id)` pair. If this would be the 4th+ review between the same two accounts, still insert the row (so the interaction succeeds and history is complete) but set `counts_toward_average=False` and do NOT add it to `global_rating_sum`/`global_rating_count` — this blunts rating-farming between colluding/alt accounts (section 4) without blocking legitimate repeat trading partners.
+4. Otherwise: insert `reviews` row, update the reviewee's `global_rating_sum`/`global_rating_count`, and clear `pending_review_deal_id` on the reviewer only if it matches this deal.
+5. Enforce the unique `(deal_id, reviewer_id)` constraint — if they somehow submit twice, show "You've already reviewed this deal."
+
+### 3.9 Invite branding line
+Every panel embed and every listing embed must end its description with a markdown hyperlink so it renders as blue clickable text inside the embed body (embed footers do not support markdown links, so this must go in the description, not the footer):
+```
+\n\n💫 *Enjoying {BOT_NAME}? [Invite it to your server!]({INVITE_URL})*
+```
+Centralize this in `utils/embeds.py` as a single helper every embed builder calls — do not duplicate this string across cogs.
+
+### 3.10 Bans & moderation scope (owner power vs. guild admin power — do not blur this line)
+
+Two entirely separate ban mechanisms. A guild admin's command must never be able to reach the global one.
+
+**Guild-scoped ban — `/moderation ban_user` (guild admins)**
+- Guard: identical to 3.1 — `Manage Guild` permission or the guild's configured `admin_role_id`. No elevated power beyond this.
+- Inserts a row into `guild_bans` (`guild_id`, `user_id`, `reason`, `banned_by`, `created_at`), scoped to `interaction.guild_id` only.
+- Effect: `is_guild_banned(guild_id, user_id)` returning `True` blocks that user from the Create Listing, Check Listings, Place Bid, and Start Deal actions performed *from within that specific guild*, and blocks any of their server-scoped listings that originated there. It has **zero effect** on any other guild the bot is in, and zero effect on their global-scoped listings already circulating elsewhere.
+- `/moderation unban_user` reverses it (delete the row) under the same guard.
+- `/moderation lookup_user` (read-only, same admin guard): shows a user's public rating, `timeout_count`, and open report count for **this guild's context only** — visibility, not an action, so it doesn't need owner-level gating.
+
+**Global ban — bot-owner only, e.g. `/owner global_ban`**
+- Guard: `await bot.is_owner(interaction.user)` — discord.py's built-in check against the Discord application's registered owner (or every member of the owning Team, if applicable). Do **not** implement this as a guild permission, a hardcoded admin role, or anything a guild admin could ever hold — it must only ever pass for the bot's actual owner.
+- Sets `user_profiles.is_banned = True/False`. This blocks the user everywhere, in every guild, from every marketplace action — the only mechanism that does.
+- Because the owner's authority isn't scoped, the same command surface can also apply a guild-specific ban in any server if useful — the point is the owner's power covers both levels, while a guild admin's power never leaves their own server.
+
+**Enforcement**: add `is_guild_banned(guild_id, user_id)` and `is_globally_banned(user_id)` to `utils/checks.py`. Every panel button callback (Create Listing, Check Listings, Place Bid, Start Deal) checks the global ban first (cheap early exit), then the guild-scoped ban for whichever guild the interaction fired in.
+
+---
+
+## 4. Abuse Prevention — Threat Model
+
+Walk through this list explicitly while building — each row is a realistic way a real user base will try to abuse this system, and the mitigation is a requirement, not a suggestion.
+
+| Abuse vector | Mitigation (already wired into section 3 above) |
+|---|---|
+| **Ghosting / time-wasting deals** — starting a deal then never responding, tying up the other party and the listing | 48h timeout sweep (3.7) reopens the listing; `timeout_count` (section 2) tracks it on both parties for admin/owner visibility via `/moderation lookup_user` — deliberately **not** auto-punitive, since a timeout can't reliably prove whose fault it was |
+| **Review bombing / retaliatory 1-stars** | One review per completed deal, enforced by a DB unique constraint (3.8) — can't be repeated to pile on |
+| **Rating farming via alt accounts or a colluding pair trading back and forth** | Same-pair review cap (3.8 step 3) — after 3 reviews between the same two accounts, further reviews stop moving the average |
+| **Listing spam / flooding the global feed** | Per-user creation cooldown (3.3 step 11), max concurrent active listings per user (3.3 step 1), duplicate-submission detection (3.3 step 8) |
+| **Bait-and-switch / off-platform payment scams** | Bot cannot see real-world payment rails, so this is a residual risk that can't be fully engineered away — mitigate with a standing disclaimer on every deal panel (3.7 step 4), a working Report Issue pipeline into a persistent `reports` table (section 2), and both ban tiers to remove repeat offenders |
+| **Self-dealing on one account to fake activity** | Direct self-deal and self-bid checks (3.6 step 2b, 3.7 step 2e) — alt-account self-dealing is a residual risk, blunted by the same-pair review cap above |
+| **IGN impersonation** (claiming to be a known trusted trader) | IGN is always labeled "self-reported" wherever shown (3.5) — never presented as verified identity |
+| **Shill bidding** (seller uses an alt to inflate their own auction) | Full `bids` audit trail retained (3.6 step 4) for investigation; can't be fully prevented against alts, but every bid is traceable |
+| **Griefing bids** (bidding to win with no intent to complete the deal) | Minimum increment + bid cooldown (3.6 step 2) slow down casual griefing; a "won" auction that ghosts still recycles via the 48h timeout and logs a `timeout_count` |
+| **Interaction/component spoofing** (crafting a button payload referencing a deal/listing the user isn't party to) | Every deal-panel and listing-action callback re-verifies `interaction.user.id` against the actual authorized party on that specific row server-side — **never** trust the `custom_id` alone (3.7 step 6) |
+| **Command/button mashing to hammer the DB** | In-memory per-user cooldowns on every interactive entry point (Create Listing, Place Bid, and generally — section 7), not just the ones with an obvious economic incentive |
+| **Orphaned data from abandoned wizards inflating storage** | Wizard state held in memory, not written to `listings` until final confirm (3.3 step 3) |
+
+---
+
+## 5. Additional Features (build these — they round out the marketplace)
+
+- **Listing expiry sweep + renewal**: DM the seller 24h before `expires_at` with a "Renew" button that resets `expires_at`.
+- **`/listing edit` and `/listing cancel`**: owner-only slash commands scoped by `listing_id`, checked against `seller_id == interaction.user.id`.
+- **`/stats`** (admin-only): total active listings, active deals, completed deals, top 5 rated users — good sanity-check command while building.
+- **Verified/Trusted badge**: append a ⭐ badge to listing embeds once a seller has ≥10 completed deals and avg rating ≥4.5 — purely cosmetic, computed at render time, not stored.
+
+---
+
+## 6. Error Prevention Boundaries (non-negotiable — implement all of these)
+
+- **Interaction timing**: every button/select/modal callback must call `interaction.response.defer()` (ephemeral where appropriate) if any DB call or multi-step logic follows, since Discord requires an ack within 3 seconds — never let a callback do a query before responding.
+- **Rate limits**: let discord.py's internal HTTP bucket handling manage backoff automatically — do not build a custom global-limit tracker. Do avoid patterns that multiply calls (e.g., never loop-fetch every guild's channels on each listing post; cache `panel_channel_id`/feed channel IDs from `guild_configs` instead — section 7). Wrap outbound bulk sends (posting a global listing to many guilds) in a small delay loop (e.g., `asyncio.sleep(0.5)` between sends) rather than firing all at once.
+- **Missing permissions**: before every send/edit to a guild channel, catch `discord.Forbidden` and `discord.HTTPException` specifically, log the guild/channel ID, and — if it's an admin-invoked command — respond with a clear ephemeral error instead of a raw traceback. For DMs, catch `discord.Forbidden` (DMs closed) and notify the *other* party in the deal that the DM couldn't be delivered, rather than silently failing the whole deal.
+- **Sharding**: not required at launch (`commands.Bot` is fine under ~2,000 guilds), but do not hardcode anything that assumes a single process — keep all state in Postgres (never in-memory dicts, except the explicitly-scoped caches/cooldowns in section 7) so a future swap to `AutoShardedBot` requires no data-layer changes.
+- **Reconnects**: rely on discord.py's built-in automatic reconnect/session-resume; do not write custom websocket reconnect logic. Do re-register persistent Views in `setup_hook()` (not just `on_ready`) since `on_ready` can fire multiple times across reconnects and duplicate registration should be idempotent.
+- **Database resilience**: use a pooled async engine (`pool_size`, `max_overflow` set conservatively, e.g. 5/10 — section 7) with `pool_pre_ping=True` so dead connections are detected and replaced automatically; wrap every write in a try/except that logs the error and rolls back the session rather than crashing the bot process.
+- **Race conditions**: the atomic conditional `UPDATE ... WHERE status='active'` pattern (3.6 step 3, 3.7 step 3) is required for listing-claiming, bid-acceptance, AND deal creation — never read-then-write across two separate queries for state transitions that two users could trigger simultaneously.
+- **Background task safety**: every `tasks.loop` job (deal timeout sweep, auction-end sweep, listing-expiry sweep, archive sweep) must be wrapped in its own try/except that logs and continues rather than letting one bad row kill the loop for every guild; register an `@tasks.loop(...).error` handler for each.
+- **48-hour deal timeout**: implement as a `tasks.loop(minutes=15)` job querying `deals` where `status='active'` and `last_activity_at < now() - interval '48 hours'`; on match, set `status='expired'`, `end_reason='timeout'`, reopen the listing to `'active'`, increment `timeout_count` for both parties, and DM both that the deal auto-closed (no review required for a timeout).
+
+---
+
+## 7. Performance & Scaling — Keep Storage and CPU Bounded
+
+Build these in from the start; retrofitting them after the tables have real data is much harder.
+
+- **Never write partial state during multi-step interactions.** The Create Listing wizard (3.3) and any other multi-step flow hold their in-progress answers on the View/session object in memory, writing to Postgres only once, at final confirm.
+- **In-memory cooldowns over DB-backed ones.** Use discord.py's built-in `app_commands.checks.cooldown()` (a per-process in-memory bucket) for the listing-creation cooldown (3.3), bid cooldown (3.6), and any other spam-prone entry point. This avoids an extra DB round-trip on every single interaction just to check a timestamp. Only fall back to a DB-persisted cooldown if it must survive a bot restart — nothing here needs that.
+- **Cache read-mostly config.** `guild_configs` (color, categories, channel IDs) changes rarely. Cache each guild's row in an in-memory dict in `utils/cache.py`, invalidated on `/setup` writes (3.1 step 3), instead of querying Postgres on every single panel button click.
+- **Hard caps to bound row counts, not just query size:**
+  - `MAX_ACTIVE_LISTINGS_PER_USER` (default `10`) — prevents one user from generating unbounded rows.
+  - `MAX_BIDS_PER_LISTING` (default `200`) — caps worst-case bid-war storage per auction.
+  - `LISTING_DESCRIPTION_MAX_LEN` (`1000`, enforced at the Modal level) and `REVIEW_COMMENT_MAX_LEN` (`500`) — bound per-row size.
+  - Query-level `LIMIT 200` on the Check Listings filter query (3.4) before pagination — bounds worst-case result-set size regardless of how broad the filter is.
+- **Index every query path** exactly as listed at the end of section 2 — the filter/search query and both sweep queries are the two hottest paths in the whole bot; unindexed, they'll be the first thing to slow down as the listings/deals tables grow.
+- **Archive, don't accumulate forever.** Add a weekly `tasks.loop` job in `background_tasks.py` that moves `listings` rows in a terminal state (`completed`/`cancelled`/`expired`) older than 90 days, along with their associated `bids`, into a separate `listings_archive`/`bids_archive` table (or deletes them if you don't need historical lookup) — keeps the hot tables small so the filter query and sweeps stay fast as usage grows. Keep `user_profiles` rating aggregates and `reviews` indefinitely (small, and needed for trust signals); it's the transactional listings/bids/deals history that drives storage growth over time.
+- **Batch sweeps as single queries.** The deal-timeout, auction-end, listing-expiry, and archive sweeps must each be one `SELECT ... WHERE ...` returning every matching row, iterated in Python for the Discord-side calls — never a per-guild or per-row query loop against the DB.
+- **Connection pool discipline.** One pooled async engine for the whole app, created once at startup; never open a new engine or raw connection inside a command handler. Keep `pool_size`/`max_overflow` modest (e.g. 5/10) since Replit's Postgres tiers have limited max connections, and a burst of concurrent interactions shouldn't be able to exhaust the pool.
+
+---
+
+## 8. Suggested Build Order for the Agent
+
+1. `database/models.py` + `database/engine.py` — get every table (including `guild_bans` and `reports`) and every index from section 2 created and verified with a throwaway test insert/select before writing any Discord-facing code.
+2. `main.py` skeleton + `config.py` — bot boots, connects, logs "ready" with zero cogs. Define all the abuse/performance constants from sections 4 and 7 here up front.
+3. `cogs/admin_setup.py` (3.1) — confirm preferences persist correctly and the config cache invalidates on change.
+4. `cogs/panel_views.py` + panel send (3.2) — confirm the panel survives a bot restart (buttons still respond).
+5. `cogs/listings.py` — create-listing wizard (3.3) end to end, confirming the in-memory-state/no-partial-writes rule and the active-listing cap actually work, then check-listings/filter/search (3.4) with the `LIMIT 200` in place.
+6. `cogs/bidding.py` — Place Bid flow (3.6): increment validation, cooldown, bid cap, and anti-snipe extension, tested with a manually shortened `auction_end_at` so you don't have to wait out a real auction window.
+7. `cogs/deals.py` — deal creation gates + persistent DM panel + dual confirm (3.7), confirming the custom_id-authorization check actually rejects a spoofed request.
+8. `cogs/reviews.py` — review modal + pending-review gate + same-pair cap (3.8), confirm it actually blocks a new deal and that the 4th+ same-pair review doesn't move the average.
+9. `background_tasks.py` — timeout/auction/expiry sweeps (section 6) and the weekly archive sweep (section 7), each tested with a manually backdated row.
+10. `cogs/moderation.py` — both ban tiers (3.10: guild-scoped `/moderation ban_user` and owner-only `/owner global_ban`, confirm a guild admin genuinely cannot trigger the global one), `/moderation lookup_user`, the `reports` table wiring on Report Issue, and `/stats` (section 5).
+11. Polish pass: verified badge, renewal DMs, invite branding line audit across every embed, and a final pass confirming every cooldown in the bot is in-memory rather than DB-backed.
+
+Confirm each phase works before moving to the next — do not write deals/reviews logic against a listings/bidding system that hasn't been manually tested yet.
