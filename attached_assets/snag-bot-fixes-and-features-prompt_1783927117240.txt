@@ -1,0 +1,475 @@
+SNAG BOT — DEAL-EXPERIENCE FIX PASS + NOTIFICATIONS + HOW-TO-USE GUIDE
+================================================================================
+
+CONTEXT — READ FIRST
+--------------------------------------------------------------------------------
+This is NOT a new build. Snag already exists and works (Python 3.11+, discord.py
+2.4+, SQLAlchemy 2.0 async + aiosqlite, cogs architecture) at:
+
+  snag-bot/
+    main.py, config.py, background_tasks.py
+    cogs/admin_setup.py, panel_views.py, listings.py, deals.py, bidding.py,
+         reviews.py, moderation.py
+    database/engine.py, database/models.py
+    utils/cache.py, checks.py, embeds.py, pagination.py, parsing.py
+
+Do NOT rewrite files wholesale. Make targeted, minimal-diff changes to the
+specific functions/classes named in each section below, in the existing style
+of the codebase (it already follows good patterns: atomic UPDATE...RETURNING
+for races, try/except discord.Forbidden around every DM, closure-safe default
+args in loops, session.begin() transactions, structured logging). Match that
+style in everything you add.
+
+This pass fixes real, confirmed bugs found by reading the current source, plus
+adds the features described below. Work through the priorities IN ORDER —
+each one is self-contained and testable before you move to the next. Don't
+try to do all of them in one giant diff; commit/checkpoint after each priority
+so a regression is easy to isolate.
+
+
+================================================================================
+PRIORITY 1 — DEALS HAVE NO ACTUAL CONVERSATION (the core reported bug)
+================================================================================
+
+THE BUG: When a deal starts, `_create_deal()` in cogs/deals.py DMs the buyer
+and seller SEPARATELY. These are two independent, disconnected DM channels
+(bot↔buyer and bot↔seller) — the two Discord users are total strangers who
+likely share no mutual server and cannot message each other directly. Right
+now the deal panel only has action buttons (Mark Complete / Cancel / Report).
+There is no way for the two parties to actually talk to coordinate the trade
+("meet at spawn", "sent it, check your chest", "what's your IGN again"). This
+is the single most important fix in this pass.
+
+THE FIX — build a message relay bridge between the two DMs for the duration
+of an active deal:
+
+1. Add an `on_message` listener (in cogs/deals.py, registered via
+   `@commands.Cog.listener()` on the Deals cog) that:
+   - Ignores messages from bots (`message.author.bot`) and anything that
+     isn't a DM (`isinstance(message.channel, discord.DMChannel)`).
+   - Looks up whether `message.author.id` is the initiator OR seller on any
+     Deal with `status == "active"` (there can only ever be one — see the
+     existing "one active deal per user" gate in `_create_deal`, condition
+     (c) — so this lookup is always unambiguous).
+   - If no active deal is found for that user, return immediately and do
+     NOT reply (no nagging pointer message — keep it silent so we don't spam
+     people who just DM the bot randomly; the How-To-Use button is the
+     right place for guidance, not on_message).
+   - If an active deal IS found, resolve the *other* party's user ID, fetch/
+     get their DM channel (`bot.get_user(other_id) or await bot.fetch_user(other_id)`
+     then `.send(...)`), and relay the message with a clear author prefix,
+     e.g.:
+       "💬 **{message.author.display_name}:** {message.content}"
+     If the original message has attachments, relay their `.url`s too (a DM
+     the bot receives is exempt from needing the Message Content privileged
+     intent — confirmed current Discord policy: this exemption applies to
+     "DMs that it receives", so plain `Intents.default()` — which the bot
+     already uses — is sufficient; you do NOT need to enable the
+     Message Content privileged intent for this feature).
+   - Wrap the relay `.send()` in try/except for `discord.Forbidden` — if it
+     fails, DM the ORIGINAL sender back: "⚠️ Couldn't deliver that — the
+     other party's DMs may be closed. Try Report Issue if this keeps
+     happening."
+   - On every successful relay, update `Deal.last_activity_at =
+     datetime.now(timezone.utc)` for that deal (open your own session; do
+     NOT reuse a session across the on_message handler and unrelated code).
+     This is important: right now `last_activity_at` is ONLY bumped by
+     button clicks (mark_complete_btn), so two people actively chatting
+     but never clicking a button would incorrectly auto-expire at the 48h
+     mark even though they're clearly active. Relayed messages must count
+     as activity.
+   - Skip relaying anything that looks like it might be a command accident
+     (e.g. starts with "!" or "/") is NOT necessary — this bot is slash-only,
+     there's no prefix-command collision risk. Relay everything.
+
+2. Update `build_deal_panel_embed()` in utils/embeds.py to make the very
+   first line of the description explicitly tell people they can just type:
+       "💬 Just type in this DM to talk to the other trader — I'll pass
+       your messages along."
+   This is the single biggest UX fix here: right now nothing in the panel
+   even hints that typing does anything.
+
+3. This relay only runs while `Deal.status == "active"`. Once a deal is
+   completed/cancelled/expired, further DMs from either party should NOT be
+   relayed (the lookup already naturally excludes non-active deals — just
+   make sure the DB filter is `Deal.status == "active"`, not "any deal").
+
+
+================================================================================
+PRIORITY 2 — DEAL LIFECYCLE EVENTS DON'T NOTIFY THE OTHER PARTY
+================================================================================
+
+THE BUG (confirmed by reading cogs/deals.py): `cancel_btn()` only ever calls
+`interaction.followup.send(...)`, which is ephemeral and visible ONLY to
+whoever clicked Cancel. The other party is never told the deal was cancelled
+— their copy of the deal panel just sits there looking active forever, and
+if they click a button on it later they'll get a confusing "deal no longer
+active" error out of nowhere. Same root problem, smaller version, on
+`mark_complete_btn()`: when only ONE party confirms, the other party is never
+nudged that their counterpart already confirmed and it's their turn.
+
+Also confirmed: NONE of the three deal-ending code paths (`cancel_btn`,
+`mark_complete_btn`'s both-confirmed branch, and `_expire_deal()` in
+background_tasks.py) ever edit the original persistent deal-panel DM messages
+(`deal.dm_message_id_initiator` / `deal.dm_message_id_seller`, both already
+stored on the Deal row). They just leave the old panel sitting there with
+live-looking buttons that will error out if clicked. Close it out properly
+every time.
+
+THE FIX:
+
+1. Add one shared helper in cogs/deals.py:
+
+     async def _close_deal_panels(bot, deal, closing_embed: discord.Embed) -> None:
+         """Edit both parties' stored DM panel messages to a closed state,
+         removing the view. Called from every deal-termination path. Never
+         raises — wrap each edit in its own try/except for discord.NotFound
+         (message deleted by the user) and discord.Forbidden."""
+
+   For each of (deal.initiator_id, deal.dm_message_id_initiator) and
+   (deal.seller_id, deal.dm_message_id_seller): fetch the user, fetch/open
+   their DM channel, `.fetch_message(id)` then `.edit(embed=closing_embed,
+   view=None)`. If dm_message_id is None (DM failed originally) or fetch
+   raises NotFound/Forbidden, just skip that side — log at debug level,
+   don't raise.
+
+2. In `cancel_btn()`:
+   - After committing `status = "cancelled"`, DM the OTHER party (not the
+     clicker — they already got their ephemeral confirmation) a clear
+     message: "❌ **{clicker display name}** cancelled Deal #{id} for
+     **{listing.title}**. The listing has been reopened — no action needed
+     from you." Wrap in try/except discord.Forbidden.
+   - Call `_close_deal_panels(bot, deal, <a "🔒 Cancelled" embed>)`.
+
+3. In `mark_complete_btn()`:
+   - Partial-confirm branch (only one side confirmed so far): DM the OTHER
+     party: "✅ **{name}** marked Deal #{id} as complete on their end!
+     Click **Mark Complete** on your side too to finish the trade." Wrap in
+     try/except discord.Forbidden. Do this in ADDITION to the existing
+     ephemeral "waiting for the other party" message to the clicker — both
+     should happen.
+   - Both-confirmed branch (deal completes): after `_send_review_prompts`,
+     also call `_close_deal_panels(bot, deal, <a "✅ Completed" embed>)` so
+     the original panel doesn't linger with working-looking buttons next to
+     the separate review-prompt DM.
+
+4. In `_expire_deal()` (background_tasks.py): the existing "Deal Auto-Closed"
+   DM to both parties already exists and is fine — just ALSO call
+   `_close_deal_panels(bot, deal, <a "⏱️ Expired" embed>)` right after (import
+   it locally inside the function to avoid a circular import, same pattern
+   already used elsewhere in this file for `DealPanelView`).
+
+5. Personalize `build_deal_panel_embed()` instead of building one generic
+   embed and sending it to both parties (current behavior in `_create_deal`
+   and `_resolve_auction` — one `deal_embed` object built once, sent twice).
+   Change its signature to something like:
+
+     build_deal_panel_embed(deal, listing, *, viewer_role: str,
+                             counterpart_user, counterpart_profile,
+                             color=None)
+
+   and build it TWICE per deal-start (once per recipient) so each side's
+   panel clearly shows:
+     - "Your role: 🛒 Buyer" or "💰 Seller"
+     - Who they're trading with (mention + IGN + rating), reusing the same
+       IGN/rating formatting already in `build_listing_embed`
+     - The agreed price (`listing.price`, or "current bid" for auctions —
+       reuse the same price-string logic already in `build_listing_embed`
+       so the two don't drift out of sync)
+   Update the three call sites (`_create_deal`, `_resolve_auction`, and
+   anywhere else a deal panel is sent) to fetch both users'
+   UserProfile rows (`get_or_create_profile`) before building either embed —
+   `_create_deal` already fetches both Discord user objects, just extend it
+   to also fetch both profiles.
+
+
+================================================================================
+PRIORITY 3 — MISSING NOTIFICATIONS (buy / bid / expiry)
+================================================================================
+
+Confirmed by reading bidding.py and background_tasks.py: these three
+notifications the user asked for do not exist yet. Add all three, following
+the exact same "fetch user, try/except discord.Forbidden, log at debug on
+failure" pattern already used everywhere else in this codebase — don't
+invent a new pattern.
+
+1. SOMEONE BIDS ON YOUR LISTING (bidding.py, `_process_bid`):
+   - In the FIRST session block (where `listing` is already loaded and
+     `current`/`min_qualifying` are computed), capture
+     `previous_highest_bidder_id = listing.highest_bidder_id` before the
+     atomic UPDATE runs later in the function. This is already-available
+     data — just hold onto it in a local variable.
+   - After the atomic UPDATE succeeds (the `if not updated:` guard already
+     tells you whether your bid won the race):
+     a. DM the SELLER: "📈 New bid on **{listing.title}** (#{id}): **{amount}
+        {currency_label}** from {bidder mention/display name}."
+     b. If `previous_highest_bidder_id` is not None AND differs from the new
+        bidder's `user_id`: DM that PREVIOUS bidder: "📉 You've been outbid on
+        **{listing.title}** (#{id})! New highest bid: **{amount}
+        {currency_label}**." Consider attaching a fresh view with a single
+        "🔨 Bid Again" button that re-opens `PlaceBidModal` for that listing
+        (nice-to-have, skip if it complicates the diff — the DM text alone
+        satisfies the ask).
+   - Both DMs go out AFTER the transaction commits, not inside `session.begin()`.
+
+2. YOUR LISTING HAS EXPIRED (background_tasks.py, `listing_expiry_sweep`,
+   the `for listing in to_expire:` loop):
+   - Right now this loop sets `status = "expired"` and only logs — it never
+     tells the seller. Add, right after the status update commits: DM the
+     seller "⌛ Your listing **{title}** (#{id}) has expired and is no longer
+     active. Create a new one anytime from the panel." Same
+     try/except(discord.Forbidden, discord.HTTPException, discord.NotFound)
+     pattern used two functions above it in the same file.
+
+3. FIX THE DUPLICATE-WARNING BUG WHILE YOU'RE IN THIS FUNCTION: the "expiring
+   soon" query re-selects every listing whose `expires_at` falls in the next
+   24h EVERY time the sweep runs (every 6 hours) with no "already warned"
+   flag — a listing sitting in that 24h window gets the identical renewal
+   DM up to 4 times before it actually expires. Fix:
+     - Add `expiry_warning_sent: Mapped[bool] = mapped_column(Boolean,
+       default=False)` to the `Listing` model in database/models.py.
+     - Filter the "soon" query to also require
+       `Listing.expiry_warning_sent == False`.
+     - Set it to `True` in the same transaction that sends the warning DM
+       (only set it if the DM send didn't raise — or set it regardless, your
+       call, but don't leave it False forever if Forbidden keeps firing).
+     - In `RenewListingView.renew_btn()` (same file), reset
+       `listing.expiry_warning_sent = False` when a listing is renewed —
+       otherwise a renewed listing would silently never get warned again on
+       its NEW expiry cycle.
+     - This is a schema change on an existing SQLite DB — `create_all_tables()`
+       in database/engine.py only CREATEs missing tables, it will not add a
+       column to an existing `listings` table. Add a tiny startup migration
+       in `create_all_tables()` (or a new `database/migrate_live.py` step,
+       there's already a file with that name — check what it currently does
+       and extend the same pattern) that runs
+       `ALTER TABLE listings ADD COLUMN expiry_warning_sent BOOLEAN DEFAULT 0`
+       wrapped in try/except so it's a no-op if the column already exists
+       (SQLite has no "ADD COLUMN IF NOT EXISTS" — catch the OperationalError
+       and check the message, or PRAGMA table_info(listings) first).
+
+4. AUCTION ENDED WITH NO VALID BIDS (background_tasks.py, `_resolve_auction`,
+   both the "no bids at all" early-return AND the "no valid winner after
+   falling through bid history" branch): DM the seller "🔨 Your auction for
+   **{listing.title}** (#{id}) ended with no valid winning bid. The listing
+   has expired." Same pattern.
+
+5. OPTIONAL BUT RECOMMENDED — losing bidders: when `_resolve_auction` finds a
+   valid winner, DM every OTHER distinct bidder (from the same `candidates`
+   list already computed, minus `valid_winner`) a short "🔨 The auction for
+   **{title}** ended — another bidder won this time." Skip if this makes the
+   diff too large; the seller/winner-side notifications above are the
+   must-have part of this priority.
+
+
+================================================================================
+PRIORITY 4 — COMPREHENSIVE "HOW TO USE" BUTTON
+================================================================================
+
+Add a 5th button to `MainPanelView` in cogs/panel_views.py — Discord allows
+5 buttons per row, so it fits on the same row as the existing 4 without
+needing a second row. Style it `discord.ButtonStyle.secondary`, label
+"❓ How to Use", custom_id `"panel:how_to_use"`.
+
+Write it assuming the reader has NEVER used a Discord bot before. Reuse the
+existing `PaginatorView` from utils/pagination.py (it already supports a list
+of embeds with Prev/Next — don't build a new paginator). Build a fixed list
+of ~7 embeds covering, in this order:
+
+  1. What is Snag? — one short paragraph: cross-server Minecraft trading
+     marketplace, works across every Discord server that has Snag installed,
+     deals happen safely over DM.
+  2. How to create a listing — literal step-by-step: click ✏️ Create Listing
+     → choose Server-only or Global → pick a category → pick which
+     Minecraft server it's for → Buying or Selling → Direct Sale or Auction
+     → fill in the title/description/price form → review the preview →
+     click Confirm & Post.
+  3. How to browse & search — click 🔍 Check Listings → use the dropdown
+     filters (MC server / category / buying-selling / direct-auction) →
+     click Server Listings or Global Listings to run it, or 🔍 Search to
+     type a keyword → use ◀ Prev / Next ▶ to page through results → click
+     Start Deal or Place Bid on anything you like.
+  4. How deals work — clicking Start Deal DMs both of you a private deal
+     panel; you can just type normally in that DM to chat with the other
+     trader (the bot relays it); you can only be in ONE deal at a time
+     across the whole bot; click ✅ Mark Complete once you've received your
+     end of the trade — the deal finishes once BOTH sides confirm; ❌ Cancel
+     Deal ends it early and reopens the listing; 🚨 Report Issue flags a
+     problem to that server's moderators; a deal with no activity for 48
+     hours auto-closes.
+  5. Reviews — after a deal completes you'll get a DM asking you to rate the
+     other trader 1–5 stars; you cannot start another deal until you've
+     rated your last completed one — this keeps ratings honest and the
+     marketplace trustworthy.
+  6. Auctions & bidding — Place Bid opens a form, bids must beat the current
+     one by the minimum increment, bidding in the last couple minutes
+     extends the auction slightly to prevent last-second sniping, and when
+     it ends the highest valid bidder automatically gets a deal DM.
+  7. Staying safe — Snag doesn't guarantee any trade; never send real-world
+     payment info; if something feels wrong use Report Issue; use 🎮 My IGN
+     to set your Minecraft name so trade partners know who they're dealing
+     with; and a reminder of the invite-branding line so people know they
+     can add Snag to their own server.
+
+Every one of these embeds should still go through `add_invite_branding()`
+like every other embed in the codebase (utils/embeds.py) for consistency.
+
+Also add a plain `/help` slash command (cogs/panel_views.py or a new small
+cog — your call) that shows the exact same paginated guide, so it's
+discoverable without needing to find a panel first. It doesn't need to be
+DM-usable specifically for this pass — a normal guild slash command is fine
+unless you want to also register it for the User install context (App
+Commands installation type = both Guild and User), which would let people
+run `/help` even DMing the bot directly — nice-to-have, not required.
+
+
+================================================================================
+PRIORITY 5 — BUGS FOUND ON INSPECTION (fix all of these — you were asked to
+be the inspector, these are real, confirmed issues, not speculative ones)
+================================================================================
+
+1. SILENT COMPONENT-ERROR SWALLOWING — none of the View subclasses in this
+   codebase (ListingActionView, DealPanelView, FilterView, every wizard step
+   view, PaginatorView, SetupView, etc.) override `on_error`. discord.py's
+   default behavior on an uncaught exception inside a button/select callback
+   is to print a traceback to stderr and tell the user NOTHING — from their
+   side the interaction just silently fails ("This interaction failed").
+   Fix: add one small base class, e.g. in a new utils/base_view.py:
+
+     class SnagView(discord.ui.View):
+         async def on_error(self, interaction, error, item):
+             logger.exception("Unhandled error in %s (item=%s)",
+                               type(self).__name__, item, exc_info=error)
+             msg = ("⚠️ Something went wrong on my end. Please try again, "
+                    "and let a server admin know if it keeps happening.")
+             try:
+                 if interaction.response.is_done():
+                     await interaction.followup.send(msg, ephemeral=True)
+                 else:
+                     await interaction.response.send_message(msg, ephemeral=True)
+             except Exception:
+                 pass
+
+   Then change every `class X(discord.ui.View)` in the codebase to
+   `class X(SnagView)`. This is a mechanical, low-risk change — do it across
+   every file, it's the single highest-value reliability fix in this pass.
+
+2. UNNECESSARY PRIVILEGED INTENT — main.py sets `intents.members = True`
+   (the privileged GUILD_MEMBERS intent). The only place that appears to
+   need it is `is_admin()` in utils/checks.py, which does
+   `interaction.guild.get_member(interaction.user.id)` to check
+   `.guild_permissions` and `.roles`. That's unnecessary: in a guild
+   interaction, `interaction.user` is ALREADY a full `discord.Member` object
+   (Discord includes complete member data — permissions and roles included —
+   directly in every interaction payload), so `interaction.user
+   .guild_permissions.manage_guild` and `interaction.user.roles` work
+   without any member cache or intent at all. Fix `is_admin()` to use
+   `interaction.user` directly instead of calling `guild.get_member(...)`,
+   then remove `intents.members = True` from main.py entirely. This matters
+   because Discord's Privileged Intent review is tied to your app's total
+   user count (10,000+ users triggers a review requirement, per Discord's
+   current developer policy as of mid-2026) — the fewer privileged intents a
+   "global, meant to scale to many servers" bot declares, the smoother that
+   review stays as Snag grows. Also remove `intents.guild_messages = True` —
+   grep the codebase; nothing currently listens for guild-channel
+   `on_message` events (the new Priority-1 relay only touches DMs, which are
+   already covered by `Intents.default()`), so that line is dead weight too.
+
+3. PER-GUILD COMMAND SYNC ON EVERY SINGLE BOOT — `setup_hook()` in main.py
+   loops over EVERY guild the bot is in and calls `bot.tree.copy_global_to`
+   + `bot.tree.sync(guild=guild)` on every single restart. Fine at a handful
+   of servers; becomes a slow, rate-limit-risking startup routine once Snag
+   is actually installed on many servers (the explicit "global, cross-server"
+   goal of this bot). Fix: keep the ONE global `bot.tree.sync()` call on
+   every boot (that's correct and necessary), but move the per-guild instant
+   sync into `on_guild_join()` ONLY — so a newly-joined server gets its
+   commands instantly, without re-syncing every server Snag has ever joined
+   on every restart.
+
+4. SQLITE DATA-LOSS RISK — CRITICAL, VERIFY BEFORE ANYTHING ELSE IN THIS
+   SECTION. `snag-bot/database/snag.db` is listed in .gitignore. If this
+   Repl's deployment does a fresh checkout/redeploy from git (rather than
+   reusing the same persistent filesystem), every listing, deal, review,
+   ban, and profile gets silently wiped. This is not hypothetical — this
+   exact pattern (gitignored SQLite file wiped on redeploy) was already hit
+   and documented as a gotcha in this same builder's PREVIOUS Discord bot
+   project. Before doing anything else:
+     a. Confirm with the current Replit deployment type (Reserved VM /
+        Autoscale / whichever is configured) whether the working directory
+        persists across redeploys, or if it does a fresh git checkout each
+        time.
+     b. If it does NOT reliably persist: either (i) move the SQLite file to
+        a location Replit guarantees is persistent and document that path
+        clearly in replit.md the same way the previous project did with
+        DATABASE_PATH, or (ii) migrate to Replit's built-in PostgreSQL
+        database integration (ask the Agent to add one — it's a first-class
+        Replit feature: persistent, 20GB free, provisions a DATABASE_URL
+        automatically) so this entire class of bug becomes structurally
+        impossible instead of something to remember to avoid. Given this bot
+        is explicitly meant to hold irreplaceable cross-server trading
+        history and reputation data, option (ii) is the safer long-term
+        call, but either is acceptable — the one unacceptable outcome is
+        leaving this unverified.
+     c. Fix the stale comment in snag-bot/.env.example — it currently says
+        "DATABASE_URL is auto-provided by Replit — do not set it manually"
+        but engine.py never reads DATABASE_URL at all (it hardcodes a local
+        SQLite path). That comment is either leftover from an earlier plan
+        or flat-out wrong right now — make the file match reality, whichever
+        way (a)/(b) above land.
+
+5. `/moderation stats` (cogs/moderation.py) reports GLOBAL counts (every
+   listing/deal across every server) under a command that's gated as
+   guild-admin-only and framed as "for this server." Either make the counts
+   guild-scoped (filter by `Listing.origin_guild_id == interaction.guild_id`
+   for the listings count; deals are trickier to scope by guild since a deal
+   spans two possibly-different origin servers — at minimum scope the
+   listings number, and either drop or clearly re-label the deal counts as
+   "network-wide") or rename the command/description to make clear it's
+   showing bot-wide numbers on purpose. Low priority — fix if time allows.
+
+
+================================================================================
+TESTING CHECKLIST — verify all of these manually before considering this
+pass done. Use two separate Discord accounts (or two alts) that do NOT share
+a mutual server, so you're testing the actual cross-server DM scenario this
+bot is built for, not a shortcut where the two accounts could already message
+each other some other way.
+--------------------------------------------------------------------------------
+[ ] Start a deal, then have EACH side type a plain message in their DM with
+    the bot — confirm the other side receives it relayed within their DM.
+[ ] Confirm a relayed message bumps last_activity_at (check the DB row, or
+    just confirm the deal doesn't get flagged inactive prematurely).
+[ ] Click Cancel Deal as one party — confirm the OTHER party gets a DM about
+    it, and both original panel messages get edited to a closed state.
+[ ] Click Mark Complete as only ONE party — confirm the other party gets a
+    "your turn" nudge DM.
+[ ] Both parties Mark Complete — confirm both original panels close out AND
+    the separate review-prompt DMs still arrive.
+[ ] Let a deal sit past the 48h timeout (or temporarily shrink
+    DEAL_TIMEOUT_HOURS in config.py for testing) — confirm both panels close
+    out on auto-expiry too.
+[ ] Place a bid on an auction — confirm the seller gets a "new bid" DM.
+[ ] Outbid an existing bidder — confirm the PREVIOUS bidder gets an "outbid"
+    DM.
+[ ] Let a listing actually expire (or shrink LISTING_EXPIRY_DAYS for
+    testing) — confirm the seller gets an "expired" DM, and confirm they do
+    NOT get the "expiring soon" warning DM more than once during the 24h
+    window before it expires.
+[ ] Renew a listing, then let the new expiry approach again — confirm the
+    warning DM fires again on the new cycle (i.e. confirm the reset actually
+    works, not just the original suppression).
+[ ] Let an auction end with zero bids — confirm the seller gets a DM.
+[ ] Click ❓ How to Use on the panel — confirm all pages render, Prev/Next
+    both work, and paging doesn't lose the "how many pages" footer.
+[ ] Force an exception inside any button callback (temporarily raise one on
+    purpose) — confirm the user gets the friendly ⚠️ error message instead
+    of a silent failure, and confirm it's logged server-side.
+[ ] Restart the bot process — confirm the panel buttons, active deal panels,
+    and listing action buttons all still work immediately after restart
+    (persistent view re-registration already exists in main.py — just make
+    sure nothing in this pass broke it).
+[ ] Confirm `/setup preferences` and `is_admin()` checks still work correctly
+    for an actual server admin after removing the members intent.
+[ ] Redeploy (or restart, depending on what's configured) and confirm the
+    database — listings, deals, reviews, bans — actually survives. This is
+    the most important check in the entire list.

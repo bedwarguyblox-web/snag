@@ -16,6 +16,7 @@ import utils.cache as guild_cache
 from database.engine import AsyncSessionLocal
 from database.models import GuildConfig
 from config import DEFAULT_EMBED_COLOR
+from utils.base_view import SnagView
 from utils.checks import admin_only, is_admin
 from utils.embeds import build_success_embed, build_error_embed
 
@@ -147,7 +148,7 @@ class SetAdminRoleModal(discord.ui.Modal, title="Set Admin Role ID"):
         )
 
 
-class SetupView(discord.ui.View):
+class SetupView(SnagView):
     """Ephemeral view shown by /setup — all settings in one place."""
 
     def __init__(self, config: GuildConfig):
@@ -337,7 +338,7 @@ class AdminSetup(commands.Cog):
             await _do_send_panel(interaction, channel)
 
 
-class _ConfirmDuplicatePanelView(discord.ui.View):
+class _ConfirmDuplicatePanelView(SnagView):
     def __init__(self, channel: discord.TextChannel, original_interaction: discord.Interaction):
         super().__init__(timeout=60)
         self._channel = channel

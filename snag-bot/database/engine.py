@@ -64,6 +64,24 @@ async def create_all_tables() -> None:
                 # Enforce foreign key constraints (off by default in SQLite)
                 await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
                 await conn.run_sync(Base.metadata.create_all)
+            # ── Startup migrations (idempotent — safe on every boot) ──────────
+            # SQLite has no "ADD COLUMN IF NOT EXISTS"; catch OperationalError instead.
+            _migrations = [
+                (
+                    "expiry_warning_sent",
+                    "ALTER TABLE listings ADD COLUMN expiry_warning_sent BOOLEAN NOT NULL DEFAULT 0",
+                ),
+            ]
+            for col_name, ddl in _migrations:
+                try:
+                    async with engine.begin() as mig_conn:
+                        await mig_conn.exec_driver_sql(ddl)
+                    logger.info("Migration: added column '%s' to listings.", col_name)
+                except OperationalError as mig_exc:
+                    if "duplicate column" in str(mig_exc).lower():
+                        pass  # Already present — idempotent
+                    else:
+                        logger.warning("Migration warning (%s): %s", col_name, mig_exc)
             if _DB_PATH.exists():
                 logger.info("Database ready at %s", _DB_PATH)
             return

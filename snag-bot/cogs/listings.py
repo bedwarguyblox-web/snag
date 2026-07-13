@@ -29,6 +29,7 @@ from config import (
 )
 from database.engine import AsyncSessionLocal
 from database.models import GuildConfig, Listing, UserProfile
+from utils.base_view import SnagView
 from utils.checks import check_marketplace_access, get_or_create_profile
 from utils.embeds import build_listing_embed, build_error_embed, build_success_embed, add_invite_branding
 from utils.pagination import PaginatorView
@@ -175,7 +176,7 @@ def _build_preview_embed(wizard: ListingWizardState) -> discord.Embed:
 
 # ─── Scope select ─────────────────────────────────────────────────────────────
 
-class ScopeSelectView(discord.ui.View):
+class ScopeSelectView(SnagView):
     def __init__(self, wizard: ListingWizardState, config: GuildConfig):
         super().__init__(timeout=300)
         self._wizard = wizard
@@ -214,7 +215,7 @@ def _get_server_cats(guild_id: int) -> list[str]:
 
 # ─── Category select ──────────────────────────────────────────────────────────
 
-class CategorySelectView(discord.ui.View):
+class CategorySelectView(SnagView):
     def __init__(self, wizard: ListingWizardState, categories: list[str]):
         super().__init__(timeout=300)
         self._wizard = wizard
@@ -236,7 +237,7 @@ class CategorySelectView(discord.ui.View):
 
 # ─── MC server tag select ─────────────────────────────────────────────────────
 
-class MCServerSelectView(discord.ui.View):
+class MCServerSelectView(SnagView):
     def __init__(self, wizard: ListingWizardState):
         super().__init__(timeout=300)
         self._wizard = wizard
@@ -258,7 +259,7 @@ class MCServerSelectView(discord.ui.View):
 
 # ─── Listing type select ──────────────────────────────────────────────────────
 
-class TypeSelectView(discord.ui.View):
+class TypeSelectView(SnagView):
     def __init__(self, wizard: ListingWizardState):
         super().__init__(timeout=300)
         self._wizard = wizard
@@ -284,7 +285,7 @@ class TypeSelectView(discord.ui.View):
 
 # ─── Format select ────────────────────────────────────────────────────────────
 
-class FormatSelectView(discord.ui.View):
+class FormatSelectView(SnagView):
     def __init__(self, wizard: ListingWizardState):
         super().__init__(timeout=300)
         self._wizard = wizard
@@ -304,7 +305,7 @@ class FormatSelectView(discord.ui.View):
 
 # ─── Confirm view ─────────────────────────────────────────────────────────────
 
-class ConfirmListingView(discord.ui.View):
+class ConfirmListingView(SnagView):
     def __init__(self, wizard: ListingWizardState):
         super().__init__(timeout=300)
         self._wizard = wizard
@@ -492,7 +493,7 @@ class SearchModal(discord.ui.Modal, title="Search Listings"):
         await _run_listing_query(interaction, self._filters)
 
 
-class FilterView(discord.ui.View):
+class FilterView(SnagView):
     def __init__(self):
         super().__init__(timeout=180)
         self._filters: dict = {}
@@ -899,7 +900,7 @@ class Listings(commands.Cog):
             )
 
 
-class _EditListingLaunchView(discord.ui.View):
+class _EditListingLaunchView(SnagView):
     def __init__(self, listing: Listing):
         super().__init__(timeout=60)
         self._listing = listing

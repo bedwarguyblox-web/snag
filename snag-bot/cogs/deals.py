@@ -1,6 +1,10 @@
 """
 Deal creation, persistent DM deal-panel, and dual-confirm completion.
-All deal-panel button callbacks re-verify the user is actually a party to that deal.
+
+Priority 1: on_message listener relays text/attachments between both parties
+            for the duration of an active deal.
+Priority 2: _close_deal_panels() edits both stored DM panel messages to a
+            closed state on every termination path (cancel / complete / expire).
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ import utils.cache as guild_cache
 from config import DEFAULT_EMBED_COLOR
 from database.engine import AsyncSessionLocal
 from database.models import Deal, Listing, UserProfile, GuildConfig, Report
+from utils.base_view import SnagView
 from utils.checks import is_globally_banned, is_guild_banned, get_or_create_profile
 from utils.embeds import build_deal_panel_embed, build_error_embed, build_success_embed
 
@@ -25,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Listing action view (Start Deal / Place Bid buttons on listing embeds) ───
 
-class ListingActionView(discord.ui.View):
+class ListingActionView(SnagView):
     """Persistent view attached to every posted listing embed."""
 
     def __init__(self, listing_id: int, format: str):
@@ -194,9 +199,12 @@ async def _create_deal(interaction: discord.Interaction, listing_id: int):
     initiator_user = interaction.user
     seller_user = bot.get_user(seller_id) or await bot.fetch_user(seller_id)
 
+    # Re-fetch listing and both profiles in a single session for embed building
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Listing).where(Listing.listing_id == listing_id))
         db_listing = result.scalar_one()
+        initiator_profile = await get_or_create_profile(session, user_id)
+        seller_profile = await get_or_create_profile(session, seller_id)
 
     view = DealPanelView(deal_id=deal_id)
 
@@ -207,9 +215,21 @@ async def _create_deal(interaction: discord.Interaction, listing_id: int):
     except (ValueError, AttributeError):
         color = DEFAULT_EMBED_COLOR
 
-    deal_embed = build_deal_panel_embed(
-        type("D", (), {"deal_id": deal_id, "status": "active"})(),
-        db_listing,
+    fake_deal = type("D", (), {"deal_id": deal_id, "status": "active"})()
+
+    # Personalized embed for each recipient
+    initiator_embed = build_deal_panel_embed(
+        fake_deal, db_listing,
+        viewer_role="🛒 Buyer",
+        counterpart_user=seller_user,
+        counterpart_profile=seller_profile,
+        color=color,
+    )
+    seller_embed = build_deal_panel_embed(
+        fake_deal, db_listing,
+        viewer_role="💰 Seller",
+        counterpart_user=initiator_user,
+        counterpart_profile=initiator_profile,
         color=color,
     )
 
@@ -217,10 +237,9 @@ async def _create_deal(interaction: discord.Interaction, listing_id: int):
     seller_msg_id = None
 
     try:
-        msg_i = await initiator_user.send(embed=deal_embed, view=view)
+        msg_i = await initiator_user.send(embed=initiator_embed, view=view)
         initiator_msg_id = msg_i.id
     except discord.Forbidden:
-        # Notify seller that initiator's DMs are closed
         try:
             await seller_user.send(
                 embed=build_error_embed(
@@ -231,7 +250,7 @@ async def _create_deal(interaction: discord.Interaction, listing_id: int):
             pass
 
     try:
-        msg_s = await seller_user.send(embed=deal_embed, view=view)
+        msg_s = await seller_user.send(embed=seller_embed, view=view)
         seller_msg_id = msg_s.id
     except discord.Forbidden:
         if initiator_msg_id:
@@ -260,9 +279,41 @@ async def _create_deal(interaction: discord.Interaction, listing_id: int):
     )
 
 
+# ─── Shared close-panels helper ───────────────────────────────────────────────
+
+async def _close_deal_panels(bot, deal, closing_embed: discord.Embed) -> None:
+    """
+    Edit both parties' stored DM panel messages to a closed state, removing
+    the view so the buttons are gone.  Called from every deal-termination path
+    (cancel, complete, expire).  Never raises — each edit is individually guarded.
+    If dm_message_id is None (DM originally failed) or fetch raises, we skip
+    that side and log at debug level.
+    """
+    for uid, msg_id in [
+        (deal.initiator_id, deal.dm_message_id_initiator),
+        (deal.seller_id, deal.dm_message_id_seller),
+    ]:
+        if msg_id is None:
+            continue
+        try:
+            user = bot.get_user(uid) or await bot.fetch_user(uid)
+            dm = user.dm_channel or await user.create_dm()
+            msg = await dm.fetch_message(msg_id)
+            await msg.edit(embed=closing_embed, view=None)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+            logger.debug(
+                "_close_deal_panels: could not edit panel for user %d (msg %d): %s",
+                uid, msg_id, exc,
+            )
+        except Exception as exc:
+            logger.debug(
+                "_close_deal_panels: unexpected error for user %d: %s", uid, exc
+            )
+
+
 # ─── Deal panel persistent view ───────────────────────────────────────────────
 
-class DealPanelView(discord.ui.View):
+class DealPanelView(SnagView):
     """
     Persistent DM deal panel.  custom_id encodes deal_id so we can re-register after restart.
     Every callback re-verifies the user is actually a party to this deal.
@@ -297,7 +348,6 @@ class DealPanelView(discord.ui.View):
     )
     async def mark_complete_btn(self, interaction: discord.Interaction, _):
         await interaction.response.defer(ephemeral=True)
-        # Update last_activity_at
         parts = interaction.data["custom_id"].split(":")
         self._deal_id = int(parts[2])
         deal = await self._verify_party(interaction)
@@ -307,6 +357,13 @@ class DealPanelView(discord.ui.View):
             await interaction.followup.send(embed=build_error_embed("This deal is no longer active."), ephemeral=True)
             return
 
+        # Capture DM message IDs before closing the session
+        initiator_dm_id = deal.dm_message_id_initiator
+        seller_dm_id = deal.dm_message_id_seller
+        initiator_id_val = deal.initiator_id
+        seller_id_val = deal.seller_id
+
+        both_confirmed = False
         async with AsyncSessionLocal() as session:
             async with session.begin():
                 r = await session.execute(select(Deal).where(Deal.deal_id == self._deal_id))
@@ -325,35 +382,65 @@ class DealPanelView(discord.ui.View):
                     deal_db.ended_at = datetime.now(timezone.utc)
                     deal_db.end_reason = "completed"
                     deal_id = deal_db.deal_id
-                    initiator_id = deal_db.initiator_id
-                    seller_id = deal_db.seller_id
                     listing_id = deal_db.listing_id
 
-                    # Update listing status
                     rl = await session.execute(select(Listing).where(Listing.listing_id == listing_id))
                     listing = rl.scalar_one_or_none()
                     if listing:
                         listing.status = "completed"
 
-                    # Set pending review on both parties and increment completed deal counts
-                    for uid in (initiator_id, seller_id):
+                    for uid in (initiator_id_val, seller_id_val):
                         profile = await get_or_create_profile(session, uid)
                         profile.pending_review_deal_id = deal_id
                         profile.completed_deals += 1
 
+        bot = interaction.client
+
         if both_confirmed:
-            bot = interaction.client
-            await _send_review_prompts(bot, deal_id, initiator_id, seller_id)
+            await _send_review_prompts(bot, deal_id, initiator_id_val, seller_id_val)
             await interaction.followup.send(
                 embed=build_success_embed("🎉 Deal completed! Both parties have confirmed. Check your DMs for a review prompt."),
                 ephemeral=True,
             )
+            # Close both deal panel messages
+            closing_embed = discord.Embed(
+                title="✅ Deal Completed",
+                description=(
+                    f"🎉 Deal #{deal_id} is done — both parties confirmed.\n"
+                    "Check your DMs for the review prompt."
+                ),
+                color=discord.Color.green(),
+            )
+            # Build a minimal object with the DM IDs for _close_deal_panels
+            _panel_ref = type("_D", (), {
+                "initiator_id": initiator_id_val,
+                "seller_id": seller_id_val,
+                "dm_message_id_initiator": initiator_dm_id,
+                "dm_message_id_seller": seller_dm_id,
+            })()
+            await _close_deal_panels(bot, _panel_ref, closing_embed)
         else:
-            other = "The seller" if interaction.user.id == deal.initiator_id else "The buyer"
+            # Partial confirm — nudge the other party
+            other_id = seller_id_val if interaction.user.id == initiator_id_val else initiator_id_val
+            other_label = "The seller" if interaction.user.id == initiator_id_val else "The buyer"
             await interaction.followup.send(
-                embed=build_success_embed(f"Your confirmation recorded. Waiting for {other} to confirm."),
+                embed=build_success_embed(f"Your confirmation recorded. Waiting for {other_label} to confirm."),
                 ephemeral=True,
             )
+            try:
+                other_user = bot.get_user(other_id) or await bot.fetch_user(other_id)
+                await other_user.send(
+                    embed=discord.Embed(
+                        description=(
+                            f"✅ **{interaction.user.display_name}** marked Deal #{self._deal_id} "
+                            f"as complete on their end! "
+                            f"Click **✅ Mark Complete** on your side too to finish the trade."
+                        ),
+                        color=discord.Color.green(),
+                    )
+                )
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
+                logger.debug("Could not nudge other party %d on partial confirm: %s", other_id, exc)
 
     @discord.ui.button(
         label="❌ Cancel Deal",
@@ -373,6 +460,8 @@ class DealPanelView(discord.ui.View):
 
         is_initiator = interaction.user.id == deal.initiator_id
         end_reason = "cancelled_by_initiator" if is_initiator else "cancelled_by_seller"
+        other_id = deal.seller_id if is_initiator else deal.initiator_id
+        clicker_name = interaction.user.display_name
 
         async with AsyncSessionLocal() as session:
             async with session.begin():
@@ -383,16 +472,50 @@ class DealPanelView(discord.ui.View):
                 deal_db.end_reason = end_reason
                 listing_id = deal_db.listing_id
 
-                # Reopen listing unless it was an already-ended auction
                 rl = await session.execute(select(Listing).where(Listing.listing_id == listing_id))
                 listing = rl.scalar_one_or_none()
-                if listing and not (listing.format == "auction" and listing.auction_end_at and listing.auction_end_at <= datetime.now(timezone.utc)):
+                listing_title = listing.title if listing else "Unknown"
+                if listing and not (
+                    listing.format == "auction"
+                    and listing.auction_end_at
+                    and listing.auction_end_at <= datetime.now(timezone.utc)
+                ):
                     listing.status = "active"
 
+        # Confirm to clicker
         await interaction.followup.send(
             embed=build_success_embed("Deal cancelled. The listing has been re-opened."),
             ephemeral=True,
         )
+
+        bot = interaction.client
+
+        # DM the other party
+        try:
+            other_user = bot.get_user(other_id) or await bot.fetch_user(other_id)
+            await other_user.send(
+                embed=discord.Embed(
+                    description=(
+                        f"❌ **{clicker_name}** cancelled Deal #{self._deal_id} for "
+                        f"**{listing_title}**. "
+                        "The listing has been reopened — no action needed from you."
+                    ),
+                    color=discord.Color.red(),
+                )
+            )
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
+            logger.debug("Could not DM other party %d on deal cancel: %s", other_id, exc)
+
+        # Close both panel messages
+        closing_embed = discord.Embed(
+            title="🔒 Deal Cancelled",
+            description=(
+                f"❌ **{clicker_name}** cancelled Deal #{self._deal_id} for **{listing_title}**.\n"
+                "This deal panel is now closed."
+            ),
+            color=discord.Color.red(),
+        )
+        await _close_deal_panels(bot, deal, closing_embed)
 
     @discord.ui.button(
         label="🚨 Report Issue",
@@ -452,7 +575,6 @@ class ReportIssueModal(discord.ui.Modal, title="Report Issue"):
                 await session.flush()
                 report_id = report.report_id
 
-        # Post to log channel
         config = guild_cache.get(origin_guild)
         if config is None:
             async with AsyncSessionLocal() as session:
@@ -497,7 +619,7 @@ async def _send_review_prompts(bot, deal_id: int, initiator_id: int, seller_id: 
                 pass
 
 
-class ReviewPromptView(discord.ui.View):
+class ReviewPromptView(SnagView):
     def __init__(self, deal_id: int, reviewer_id: int, reviewee_id: int):
         super().__init__(timeout=None)
         self._deal_id = deal_id
@@ -522,9 +644,81 @@ class ReviewPromptView(discord.ui.View):
         await interaction.response.send_modal(ReviewModal(deal_id=deal_id, reviewer_id=reviewer_id, reviewee_id=reviewee_id))
 
 
+# ─── Deals cog (on_message relay + cog registration) ─────────────────────────
+
 class Deals(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        """
+        Relay DMs between both parties of an active deal for the duration it's active.
+
+        Discord's DM exemption (Intents.default() — no privileged intent needed):
+        The Message Content privileged intent is exempt for DMs the bot *receives*
+        — confirmed current Discord policy for "DMs that it receives", so
+        message.content is always available here without any extra intent.
+
+        Design decisions (per spec):
+        - Silent if no active deal found (no nagging pointer message).
+        - Relay everything — bot is slash-only, no prefix collision risk.
+        - Bump last_activity_at on every successful relay so the 48h timeout
+          counts real conversation, not just button clicks.
+        - Wrap relay send in try/except; DM the original sender on Forbidden.
+        """
+        if message.author.bot:
+            return
+        if not isinstance(message.channel, discord.DMChannel):
+            return
+
+        user_id = message.author.id
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Deal).where(
+                    Deal.status == "active",
+                    (Deal.initiator_id == user_id) | (Deal.seller_id == user_id),
+                )
+            )
+            deal = result.scalar_one_or_none()
+
+        if not deal:
+            # No active deal — stay silent
+            return
+
+        other_id = deal.seller_id if user_id == deal.initiator_id else deal.initiator_id
+
+        # Build relay text
+        relay_text = f"💬 **{message.author.display_name}:** {message.content}"
+        if message.attachments:
+            urls = "\n".join(a.url for a in message.attachments)
+            relay_text += f"\n{urls}"
+
+        try:
+            other_user = self.bot.get_user(other_id) or await self.bot.fetch_user(other_id)
+            await other_user.send(relay_text)
+
+            # Bump last_activity_at — chatting counts as activity, not just button clicks
+            async with AsyncSessionLocal() as session:
+                async with session.begin():
+                    r = await session.execute(
+                        select(Deal).where(Deal.deal_id == deal.deal_id)
+                    )
+                    d = r.scalar_one_or_none()
+                    if d and d.status == "active":
+                        d.last_activity_at = datetime.now(timezone.utc)
+
+        except (discord.Forbidden, discord.HTTPException):
+            try:
+                await message.channel.send(
+                    "⚠️ Couldn't deliver that — the other party's DMs may be closed. "
+                    "Try **Report Issue** if this keeps happening."
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.error("on_message relay failed for deal %d: %s", deal.deal_id, exc)
 
 
 async def setup(bot: commands.Bot):

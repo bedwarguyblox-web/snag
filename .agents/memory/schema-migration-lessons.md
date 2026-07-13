@@ -1,6 +1,6 @@
 ---
 name: Schema migration lessons
-description: Recurring failure modes — create_all() silent no-ops, untraced write paths, and code/DB drift going undetected until a live crash.
+description: Recurring failure modes — create_all() silent no-ops, untraced write paths, code/DB drift, and the startup-migration pattern for simple columns.
 ---
 
 # Schema migration lessons
@@ -9,9 +9,34 @@ description: Recurring failure modes — create_all() silent no-ops, untraced wr
 
 `Base.metadata.create_all()` only creates tables that don't exist yet. It will silently skip a table that exists even if columns were added, types changed, or FKs corrected in models.py. This is what shipped the BigInteger PK bug and would have swallowed the `completed_deals` column addition if the DB had existed.
 
-**Why:** SQLAlchemy's `create_all` is designed to be idempotent against existing schemas, not to evolve them. "Safe on every startup" is accurate but misleading — it does nothing when a change actually needs to land.
+**Why:** SQLAlchemy's `create_all` is designed to be idempotent against existing schemas, not to evolve them.
 
-**How to apply:** Any schema change (new column, type fix, FK fix) on a live database needs an explicit migration step — either drop+recreate (dev only, after confirming no real data) or a proper ALTER TABLE / migration script. For production: adopt Alembic. At minimum, add a schema version check at startup using `PRAGMA table_info`.
+**How to apply:** Any schema change (new column, type fix, FK fix) on a live database needs an explicit migration step — either drop+recreate (dev only) or ALTER TABLE. For production: use the startup migration pattern below, or Alembic.
+
+## Startup migration pattern for simple columns
+
+For single boolean/integer/text columns with simple defaults, use idempotent `ALTER TABLE` in `create_all_tables()` in `database/engine.py`:
+
+```python
+_migrations = [
+    ("col_name", "ALTER TABLE table ADD COLUMN col_name TYPE NOT NULL DEFAULT x"),
+]
+for col_name, ddl in _migrations:
+    try:
+        async with engine.begin() as mig_conn:
+            await mig_conn.exec_driver_sql(ddl)
+    except OperationalError as e:
+        if "duplicate column" in str(e).lower():
+            pass  # Already present — idempotent
+        else:
+            logger.warning(...)
+```
+
+This runs on every boot but is safe (duplicate column is caught). No separate migration script needed.
+
+**Why:** A separate migration script (`database/migrate_live.py`) requires the operator to remember to run it before restarting. The startup pattern eliminates that human step for simple additions.
+
+**How to apply:** Use startup migrations for new boolean/integer/text columns with simple defaults. Use a proper migration script for: type changes, dropping columns, renaming columns, adding FK constraints, or anything requiring a data backfill.
 
 ## Every model field needs a confirmed write path before it's trusted
 
@@ -23,14 +48,13 @@ description: Recurring failure modes — create_all() silent no-ops, untraced wr
 
 ## Schema change shipped in code without migrating the live DB (recurring)
 
-This is the failure mode that caused the `sqlite3.OperationalError: no such column: user_profiles.completed_deals` live crash, and the same pattern that silently broke the BigInteger PK earlier. In both cases, models.py was updated correctly, but the live snag.db was not migrated alongside it — so the code expected columns or types that did not exist in the running database. The gap went undetected until a real user triggered the affected code path.
+This caused the `sqlite3.OperationalError: no such column: user_profiles.completed_deals` live crash. In both cases, models.py was updated correctly, but the live snag.db was not migrated — so the code expected columns that did not exist.
 
-**Why:** There is no Alembic, no migration runner, and no startup schema check. `create_all()` silently no-ops on existing tables (see above), so there is no automatic safety net. Schema drift accumulates invisibly until runtime.
+**Why:** No Alembic, no migration runner, no startup schema check by default. `create_all()` silently no-ops on existing tables.
 
-**How to apply:** Any time models.py is changed (new column, type change, FK fix), this checklist must run before deploying:
-1. Write and test a migration script (`database/migrate_live.py` is the template).
-2. Back up the live DB first (`cp snag.db snag.db.bak`).
-3. Run the migration script against the live DB and confirm all PRAGMA checks pass.
-4. Only then restart the bot.
+**How to apply:** Any time models.py is changed, this checklist must run before deploying:
+1. If simple column: add to the startup migration list in `database/engine.py`.
+2. If complex change: write a migration script, back up the live DB first, run and verify.
+3. Only then restart the bot.
 
-Next time a model field changes, the first question is: *what ALTER TABLE statement does this require on the live DB, and has it been run?* Not "does the code look right."
+Always ask: *what ALTER TABLE statement does this require on the live DB, and has it been run?*

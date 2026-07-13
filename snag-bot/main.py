@@ -25,9 +25,12 @@ logger = logging.getLogger("snag")
 # ─── Intents ──────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.guilds = True
-intents.guild_messages = True
-intents.members = True          # Privileged — enable in Developer Portal
-# message_content only needed for prefix commands (we use slash only, so skip it)
+# guild_messages: not needed — the DM relay only listens for DM messages, which
+# are covered by Intents.default() without the privileged guild_messages intent.
+# members: not needed — is_admin() uses interaction.user directly (Discord includes
+# full Member data in every guild interaction payload, no cache or intent required).
+# Keeping privileged intents minimal matters at scale: Discord requires a review
+# for apps that declare them once they exceed 10,000 servers.
 
 # ─── Bot ──────────────────────────────────────────────────────────────────────
 bot = commands.Bot(
@@ -104,14 +107,11 @@ async def setup_hook() -> None:
         logger.info("Global sync: %d command(s).", len(synced))
     except Exception as exc:
         logger.error("Global sync failed: %s", exc)
-
-    for guild in bot.guilds:
-        try:
-            bot.tree.copy_global_to(guild=guild)
-            await bot.tree.sync(guild=guild)
-        except Exception as exc:
-            logger.warning("Guild sync failed for %s (%s): %s", guild.name, guild.id, exc)
-    logger.info("Instant guild sync complete for %d server(s).", len(bot.guilds))
+    # Per-guild instant sync now runs only in on_guild_join (see below).
+    # Syncing every guild on every restart is slow and risks hitting Discord's
+    # rate-limit once the bot is on many servers — global sync (above) is
+    # sufficient for command propagation; guild sync is only needed for instant
+    # availability the first time a new guild is added.
 
 
 async def _re_register_active_deal_views() -> None:
@@ -210,6 +210,15 @@ async def on_guild_join(guild: discord.Guild):
             if not result.scalar_one_or_none():
                 session.add(GuildConfig(guild_id=guild.id))
     logger.info("Joined guild '%s' (%d) — config row created.", guild.name, guild.id)
+
+    # Instant per-guild sync so the new server's members can see slash commands
+    # immediately without waiting up to 1 hour for Discord's global propagation.
+    try:
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        logger.info("Instant guild sync complete for '%s' (%d).", guild.name, guild.id)
+    except Exception as exc:
+        logger.warning("Guild sync failed for '%s' (%d): %s", guild.name, guild.id, exc)
 
 
 @bot.tree.error

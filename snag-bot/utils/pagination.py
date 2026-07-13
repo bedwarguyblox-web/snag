@@ -10,9 +10,10 @@ from typing import Callable
 import discord
 
 from config import LISTINGS_PER_PAGE
+from utils.base_view import SnagView
 
 
-class PaginatorView(discord.ui.View):
+class PaginatorView(SnagView):
     """
     Generic paginator.  Pass a list of discord.Embed objects (one per item)
     or a list of (title, description) tuples — the paginator wraps them into

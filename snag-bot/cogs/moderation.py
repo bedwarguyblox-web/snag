@@ -173,11 +173,20 @@ class Moderation(commands.Cog):
     @admin_only()
     async def stats(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        guild_id = interaction.guild_id
 
         async with AsyncSessionLocal() as session:
+            # Listings: scoped to this server (origin_guild_id).
             active_listings = (
-                await session.execute(select(func.count()).where(Listing.status == "active"))
+                await session.execute(
+                    select(func.count()).where(
+                        Listing.status == "active",
+                        Listing.origin_guild_id == guild_id,
+                    )
+                )
             ).scalar_one()
+            # Deals: cross-server by design (a deal may span two guilds) — show
+            # network-wide counts and label them clearly so admins aren't confused.
             active_deals = (
                 await session.execute(select(func.count()).where(Deal.status == "active"))
             ).scalar_one()
@@ -197,9 +206,9 @@ class Moderation(commands.Cog):
             top_users = top_result.scalars().all()
 
         embed = discord.Embed(title="📊 Snag Marketplace Stats", color=0x5865F2)
-        embed.add_field(name="Active Listings", value=str(active_listings), inline=True)
-        embed.add_field(name="Active Deals", value=str(active_deals), inline=True)
-        embed.add_field(name="Completed Deals", value=str(completed_deals), inline=True)
+        embed.add_field(name="Active Listings (this server)", value=str(active_listings), inline=True)
+        embed.add_field(name="Active Deals (network-wide)", value=str(active_deals), inline=True)
+        embed.add_field(name="Completed Deals (network-wide)", value=str(completed_deals), inline=True)
 
         if top_users:
             top_lines = []

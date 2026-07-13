@@ -28,6 +28,7 @@ from config import (
 )
 from database.engine import AsyncSessionLocal, engine, DB_PATH
 from database.models import Deal, Listing, UserProfile, GuildConfig, ListingArchive, BidArchive, Bid
+from utils.base_view import SnagView
 
 if TYPE_CHECKING:
     from discord.ext.commands import Bot
@@ -125,6 +126,22 @@ async def _expire_deal(bot: "Bot", deal: Deal) -> None:
         except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
             logger.debug("Could not DM user %d on deal timeout: %s", uid, exc)
 
+    # Close both deal-panel DM messages so the buttons stop working.
+    # Local import avoids circular: background_tasks → deals → background_tasks.
+    try:
+        from cogs.deals import _close_deal_panels
+        closing_embed = discord.Embed(
+            title="⏱️ Deal Auto-Closed",
+            description=(
+                f"Deal #{deal.deal_id} was automatically closed due to 48 hours of inactivity.\n"
+                "This deal panel is now closed."
+            ),
+            color=discord.Color.orange(),
+        )
+        await _close_deal_panels(bot, deal, closing_embed)
+    except Exception as exc:
+        logger.debug("_expire_deal: could not close panels for deal %d: %s", deal.deal_id, exc)
+
 
 # ─── Auction end sweep (every 1 minute) ───────────────────────────────────────
 
@@ -169,7 +186,7 @@ async def _resolve_auction(bot: "Bot", listing: Listing) -> None:
 
     winner_id = listing.highest_bidder_id
 
-    # No bids — expire
+    # No bids — expire listing and notify seller
     if not winner_id:
         async with AsyncSessionLocal() as session:
             async with session.begin():
@@ -177,6 +194,19 @@ async def _resolve_auction(bot: "Bot", listing: Listing) -> None:
                 l = rl.scalar_one_or_none()
                 if l and l.status == "active":
                     l.status = "expired"
+        try:
+            seller_user = bot.get_user(listing.seller_id) or await bot.fetch_user(listing.seller_id)
+            await seller_user.send(
+                embed=discord.Embed(
+                    description=(
+                        f"🔨 Your auction for **{listing.title}** (#{listing.listing_id}) "
+                        f"ended with no bids and has expired."
+                    ),
+                    color=discord.Color.greyple(),
+                )
+            )
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
+            logger.debug("Could not DM seller %d on no-bid auction end: %s", listing.seller_id, exc)
         return
 
     # Try winner, then fall back through bid history if gates fail
@@ -227,13 +257,26 @@ async def _resolve_auction(bot: "Bot", listing: Listing) -> None:
         break
 
     if not valid_winner:
-        # No valid bidder — expire listing
+        # No valid bidder — expire listing and notify seller
         async with AsyncSessionLocal() as session:
             async with session.begin():
                 rl = await session.execute(select(Listing).where(Listing.listing_id == listing.listing_id))
                 l = rl.scalar_one_or_none()
                 if l and l.status == "active":
                     l.status = "expired"
+        try:
+            seller_user = bot.get_user(listing.seller_id) or await bot.fetch_user(listing.seller_id)
+            await seller_user.send(
+                embed=discord.Embed(
+                    description=(
+                        f"🔨 Your auction for **{listing.title}** (#{listing.listing_id}) "
+                        f"ended but no bidder was eligible to complete the trade. The listing has expired."
+                    ),
+                    color=discord.Color.greyple(),
+                )
+            )
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
+            logger.debug("Could not DM seller %d on no-valid-winner: %s", listing.seller_id, exc)
         return
 
     # Atomic claim + deal creation
@@ -260,22 +303,57 @@ async def _resolve_auction(bot: "Bot", listing: Listing) -> None:
             await session.flush()
             deal_id = deal.deal_id
 
-    # DM both parties
+    # DM both parties with personalized deal panel embeds
     async with AsyncSessionLocal() as session:
         rl = await session.execute(select(Listing).where(Listing.listing_id == listing.listing_id))
         db_listing = rl.scalar_one()
+        winner_profile = await get_or_create_profile(session, valid_winner)
+        seller_profile = await get_or_create_profile(session, listing.seller_id)
 
-    from cogs.deals import ReviewPromptView
     view = DealPanelView(deal_id=deal_id)
     fake_deal = type("D", (), {"deal_id": deal_id, "status": "active"})()
-    embed = build_deal_panel_embed(fake_deal, db_listing)
 
-    for uid in (valid_winner, listing.seller_id):
+    try:
+        winner_user = bot.get_user(valid_winner) or await bot.fetch_user(valid_winner)
+        seller_user = bot.get_user(listing.seller_id) or await bot.fetch_user(listing.seller_id)
+
+        winner_embed = build_deal_panel_embed(
+            fake_deal, db_listing,
+            viewer_role="🛒 Buyer (winning bidder)",
+            counterpart_user=seller_user,
+            counterpart_profile=seller_profile,
+        )
+        seller_embed = build_deal_panel_embed(
+            fake_deal, db_listing,
+            viewer_role="💰 Seller",
+            counterpart_user=winner_user,
+            counterpart_profile=winner_profile,
+        )
+
+        for user, embed in ((winner_user, winner_embed), (seller_user, seller_embed)):
+            try:
+                await user.send(embed=embed, view=view)
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
+                logger.debug("Could not DM user %d for auction deal: %s", user.id, exc)
+    except Exception as exc:
+        logger.error("_resolve_auction: failed to DM deal parties: %s", exc)
+
+    # DM losing bidders (every distinct bidder except the winner)
+    losing_bidder_ids = [c for c in candidates if c != valid_winner]
+    for loser_id in losing_bidder_ids:
         try:
-            user = bot.get_user(uid) or await bot.fetch_user(uid)
-            await user.send(embed=embed, view=view)
+            loser_user = bot.get_user(loser_id) or await bot.fetch_user(loser_id)
+            await loser_user.send(
+                embed=discord.Embed(
+                    description=(
+                        f"🔨 The auction for **{listing.title}** (#{listing.listing_id}) "
+                        f"has ended — another bidder won this time."
+                    ),
+                    color=discord.Color.greyple(),
+                )
+            )
         except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
-            logger.debug("Could not DM user %d for auction deal: %s", uid, exc)
+            logger.debug("Could not DM losing bidder %d: %s", loser_id, exc)
 
 
 # ─── Listing expiry sweep (every 6 hours) ─────────────────────────────────────
@@ -291,12 +369,13 @@ async def listing_expiry_sweep(bot: "Bot") -> None:
         warning_cutoff = now + timedelta(hours=LISTING_EXPIRY_RENEW_NOTIFY_HOURS_BEFORE)
 
         async with AsyncSessionLocal() as session:
-            # Listings about to expire (within the next 24h, not yet notified)
+            # Listings about to expire (within the next 24h, warning not yet sent)
             expiring_soon = await session.execute(
                 select(Listing).where(
                     Listing.status == "active",
                     Listing.expires_at > now,
                     Listing.expires_at <= warning_cutoff,
+                    Listing.expiry_warning_sent == False,  # noqa: E712 — SQLAlchemy requires ==
                 )
             )
             soon = expiring_soon.scalars().all()
@@ -330,7 +409,24 @@ async def listing_expiry_sweep(bot: "Bot") -> None:
             except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
                 logger.debug("Could not DM seller %d for expiry warning: %s", listing.seller_id, exc)
 
-        # Expire overdue listings
+            # Mark warning sent regardless of whether DM succeeded — repeated
+            # DMs on Forbidden are still spam and provide no value.
+            try:
+                async with AsyncSessionLocal() as flag_session:
+                    async with flag_session.begin():
+                        rl = await flag_session.execute(
+                            select(Listing).where(Listing.listing_id == listing.listing_id)
+                        )
+                        l = rl.scalar_one_or_none()
+                        if l:
+                            l.expiry_warning_sent = True
+            except Exception as flag_exc:
+                logger.error(
+                    "Error setting expiry_warning_sent for listing %d: %s",
+                    listing.listing_id, flag_exc,
+                )
+
+        # Expire overdue listings and notify sellers
         for listing in to_expire:
             try:
                 async with AsyncSessionLocal() as session:
@@ -339,6 +435,27 @@ async def listing_expiry_sweep(bot: "Bot") -> None:
                         l = rl.scalar_one_or_none()
                         if l and l.status == "active":
                             l.status = "expired"
+
+                # DM seller — after commit, not inside session.begin()
+                try:
+                    seller_user = bot.get_user(listing.seller_id) or await bot.fetch_user(listing.seller_id)
+                    await seller_user.send(
+                        embed=discord.Embed(
+                            title="⌛ Listing Expired",
+                            description=(
+                                f"Your listing **{listing.title}** (#{listing.listing_id}) "
+                                f"has expired and is no longer active. "
+                                f"Create a new one anytime from the panel."
+                            ),
+                            color=discord.Color.greyple(),
+                        )
+                    )
+                except (discord.Forbidden, discord.HTTPException, discord.NotFound) as dm_exc:
+                    logger.debug(
+                        "Could not DM seller %d for listing expiry: %s",
+                        listing.seller_id, dm_exc,
+                    )
+
             except Exception as exc:
                 logger.error("Error expiring listing %d: %s", listing.listing_id, exc)
 
@@ -357,7 +474,7 @@ async def listing_expiry_sweep_error(error: Exception) -> None:
     logger.error("listing_expiry_sweep loop error: %s", error)
 
 
-class RenewListingView(discord.ui.View):
+class RenewListingView(SnagView):
     def __init__(self, listing_id: int):
         super().__init__(timeout=None)
         self._listing_id = listing_id
@@ -390,6 +507,8 @@ class RenewListingView(discord.ui.View):
                     )
                     return
                 listing.expires_at = datetime.now(timezone.utc) + timedelta(days=LISTING_EXPIRY_DAYS)
+                # Reset warning flag so the seller gets a fresh reminder on the new expiry cycle
+                listing.expiry_warning_sent = False
 
         await interaction.followup.send(
             embed=discord.Embed(

@@ -158,6 +158,12 @@ async def _process_bid(
             )
             return False
 
+        # Capture for post-commit notifications — must happen before session closes.
+        # expire_on_commit=False means these are readable after the session exits.
+        previous_highest_bidder_id = listing.highest_bidder_id
+        listing_seller_id = listing.seller_id
+        listing_title = listing.title
+
     # ── Atomic conditional UPDATE ──────────────────────────────────────────
     async with AsyncSessionLocal() as session:
         async with session.begin():
@@ -228,6 +234,46 @@ async def _process_bid(
         ),
         ephemeral=True,
     )
+
+    # ── Post-commit notifications ──────────────────────────────────────────
+    # These run after the transaction commits — never inside session.begin().
+    bot = interaction.client
+
+    # 1. Notify the seller a new bid arrived
+    try:
+        seller_user = bot.get_user(listing_seller_id) or await bot.fetch_user(listing_seller_id)
+        await seller_user.send(
+            embed=discord.Embed(
+                description=(
+                    f"📈 New bid on **{listing_title}** (#{listing_id}): "
+                    f"**{amount:.2f} {listing.currency_label}** "
+                    f"from **{interaction.user.display_name}**."
+                ),
+                color=discord.Color.green(),
+            )
+        )
+    except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
+        logger.debug("Could not DM seller %d on new bid: %s", listing_seller_id, exc)
+
+    # 2. Notify the previous highest bidder they've been outbid
+    if previous_highest_bidder_id is not None and previous_highest_bidder_id != user_id:
+        try:
+            prev_user = (
+                bot.get_user(previous_highest_bidder_id)
+                or await bot.fetch_user(previous_highest_bidder_id)
+            )
+            await prev_user.send(
+                embed=discord.Embed(
+                    description=(
+                        f"📉 You've been outbid on **{listing_title}** (#{listing_id})! "
+                        f"New highest bid: **{amount:.2f} {listing.currency_label}**."
+                    ),
+                    color=discord.Color.orange(),
+                )
+            )
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
+            logger.debug("Could not DM outbid user %d: %s", previous_highest_bidder_id, exc)
+
     return True
 
 

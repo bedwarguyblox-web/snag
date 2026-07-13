@@ -112,20 +112,72 @@ def build_listing_embed(listing, seller_profile=None, guild_color: int | None = 
     return embed
 
 
-def build_deal_panel_embed(deal, listing, color: int | None = None) -> discord.Embed:
-    """Build the persistent deal DM panel embed."""
+def build_deal_panel_embed(
+    deal,
+    listing,
+    *,
+    viewer_role: str = "Trader",
+    counterpart_user=None,
+    counterpart_profile=None,
+    color: int | None = None,
+) -> discord.Embed:
+    """
+    Build the persistent deal DM panel embed, personalized for each recipient.
+
+    viewer_role         — "🛒 Buyer" or "💰 Seller" (shown to THIS recipient)
+    counterpart_user    — discord.User / Member of the OTHER party (optional)
+    counterpart_profile — UserProfile ORM row for the other party (optional)
+
+    Price display re-uses the same logic as build_listing_embed so the two
+    never drift out of sync.
+    """
+    if listing.format == "auction" and listing.highest_bid is not None:
+        price_str = f"{listing.highest_bid} {listing.currency_label} *(winning bid)*"
+    elif listing.price is not None:
+        price_str = f"{listing.price} {listing.currency_label}"
+    else:
+        price_str = "N/A"
+
     embed = discord.Embed(
         title=f"🤝 Deal #{deal.deal_id} — {listing.title}",
         description=(
-            f"You are in an active deal for **{listing.title}**.\n"
-            f"Use the buttons below to manage the deal.\n\n"
-            f"⚠️ **{BOT_NAME} does not guarantee any transaction — never send "
-            f"real-world payment info, and use Report Issue if something feels wrong.**"
+            "💬 **Just type in this DM to talk to the other trader — "
+            "I'll pass your messages along.**\n\n"
+            f"**Your role:** {viewer_role}\n"
+            f"**Price:** {price_str}"
         ),
         color=color or DEFAULT_EMBED_COLOR,
     )
-    embed.add_field(name="Status", value=deal.status.title(), inline=True)
-    embed.add_field(name="Listing ID", value=str(listing.listing_id), inline=True)
+
+    # Counterpart section — who they're trading with
+    if counterpart_user is not None:
+        cp_lines = [counterpart_user.mention]
+        if counterpart_profile is not None:
+            if counterpart_profile.ign:
+                cp_lines.append(f"IGN: {counterpart_profile.ign} *(self-reported)*")
+            if counterpart_profile.global_rating_count > 0:
+                avg = (
+                    counterpart_profile.global_rating_sum
+                    / counterpart_profile.global_rating_count
+                )
+                cp_lines.append(
+                    f"⭐ {avg:.1f} ({counterpart_profile.global_rating_count} reviews)"
+                )
+            else:
+                cp_lines.append("No reviews yet")
+        embed.add_field(name="Trading With", value="\n".join(cp_lines), inline=True)
+
+    embed.add_field(name="Listing", value=f"#{listing.listing_id}", inline=True)
+    embed.add_field(name="Status", value=deal.status.replace("_", " ").title(), inline=True)
+    embed.add_field(
+        name="⚠️ Safety",
+        value=(
+            f"{BOT_NAME} doesn't guarantee any trade — never send real-world payment info. "
+            "Use **Report Issue** if something feels wrong."
+        ),
+        inline=False,
+    )
+
     add_invite_branding(embed)
     return embed
 

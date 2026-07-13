@@ -90,13 +90,18 @@ def _banned_embed(msg: str) -> discord.Embed:
 # ─── Admin guard helper ───────────────────────────────────────────────────────
 
 async def is_admin(interaction: discord.Interaction) -> bool:
-    """True if the invoker has Manage Guild or holds the guild's configured admin_role_id."""
+    """True if the invoker has Manage Guild or holds the guild's configured admin_role_id.
+
+    In a guild interaction, `interaction.user` is already a full discord.Member
+    object — Discord includes complete member data (permissions AND roles) in every
+    interaction payload.  Using it directly means we don't need the privileged
+    GUILD_MEMBERS intent or the member cache at all.
+    """
     if interaction.guild is None:
         return False
-    member = interaction.guild.get_member(interaction.user.id)
-    if member is None:
-        return False
-    if member.guild_permissions.manage_guild:
+
+    user = interaction.user  # Already a Member inside a guild interaction
+    if user.guild_permissions.manage_guild:
         return True
 
     # Check configured admin_role_id
@@ -112,7 +117,7 @@ async def is_admin(interaction: discord.Interaction) -> bool:
                 cache_mod.set(config)
 
     if config and config.admin_role_id:
-        return any(r.id == config.admin_role_id for r in member.roles)
+        return any(r.id == config.admin_role_id for r in user.roles)
 
     return False
 

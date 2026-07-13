@@ -152,6 +152,11 @@ class Listing(Base):
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_listing_expires
     )
+    # Set True once the "expiring soon" warning DM has been sent, reset to False
+    # on renewal so the warning fires again on the new expiry cycle.
+    # NOTE: This column is added by a startup migration in database/engine.py —
+    # create_all() does not add columns to existing tables.
+    expiry_warning_sent: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 # ─── bids ──────────────────────────────────────────────────────────────────────
