@@ -80,6 +80,10 @@ LISTING_EXPIRY_RENEW_NOTIFY_HOURS_BEFORE: int = 24
 ARCHIVE_AFTER_DAYS: int = 90                      # move terminal listings to archive after 90 d
 ARCHIVE_SWEEP_HOURS: int = 168                    # weekly (7 * 24)
 
+# Archive retention — irreversible hard-delete of old archive rows
+ARCHIVE_PURGE_AFTER_DAYS: int = 730              # permanently delete archive rows after 2 years
+VACUUM_SWEEP_HOURS: int = 720                     # reclaim disk space monthly (30 * 24)
+
 # Listings query hard cap before pagination
 LISTINGS_QUERY_HARD_LIMIT: int = 200
 LISTINGS_PER_PAGE: int = 5

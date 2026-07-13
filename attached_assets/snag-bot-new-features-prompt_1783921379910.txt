@@ -1,0 +1,292 @@
+Snag Bot — Feature Additions: Price Sort, Inline Start Deal, No Channel
+Posting, My Listings, Button-Driven Edit
+
+I read through the actual current code (listings.py, deals.py, pagination.py,
+panel_views.py) before writing this, so file/line references below match
+what's really there. Five features, and they're sequenced because #3 and #4
+both depend on the same PaginatorView change in #2 — do them in order.
+
+═══════════════════════════════════════════════════════════════════
+STEP 1 — Price sort filters (Low→High / High→Low)
+═══════════════════════════════════════════════════════════════════
+File: cogs/listings.py, class FilterView (around line 582) and
+_run_listing_query (around line 658).
+
+FilterView's row 4 currently has exactly 3 buttons (🔍 Search,
+🏠 Server Listings, 🌐 Global Listings) — there's room for exactly 2 more
+in that row before it's full. Add:
+
+    @discord.ui.button(label="💰 Price: Low→High", style=discord.ButtonStyle.secondary, custom_id="filter:sort_low", row=4)
+    async def sort_low(self, interaction: discord.Interaction, _):
+        await interaction.response.defer(ephemeral=True)
+        self._filters["sort"] = "price_asc"
+        await _run_listing_query(interaction, self._filters, guild_id=self._filters.get("_last_guild_id"))
+
+    @discord.ui.button(label="💰 Price: High→Low", style=discord.ButtonStyle.secondary, custom_id="filter:sort_high", row=4)
+    async def sort_high(self, interaction: discord.Interaction, _):
+        await interaction.response.defer(ephemeral=True)
+        self._filters["sort"] = "price_desc"
+        await _run_listing_query(interaction, self._filters, guild_id=self._filters.get("_last_guild_id"))
+
+(The `_last_guild_id` bit only matters if you want sort to be re-clickable
+after a Server Listings search without losing the guild scope — check how
+guild_id currently flows into repeated filter clicks and match the existing
+convention; don't invent a new state-tracking mechanism if one already
+exists.)
+
+In _run_listing_query, after the query is built and before `.limit(...)` is
+applied, add ordering based on the sort filter:
+
+    sort = filters.get("sort")
+    if sort == "price_asc":
+        q = q.order_by(Listing.price.asc())
+    elif sort == "price_desc":
+        q = q.order_by(Listing.price.desc())
+
+Listings with a NULL price (if that's possible in this schema — check
+Listing.price nullability) should sort last regardless of direction, not
+first — confirm SQLite's default NULL ordering does what you want here, or
+add `.order_by(Listing.price.is_(None), ...)` ahead of the asc/desc clause
+if not.
+
+═══════════════════════════════════════════════════════════════════
+STEP 2 — Give PaginatorView a per-page action button (needed by #3 and #4)
+═══════════════════════════════════════════════════════════════════
+File: utils/pagination.py
+
+Right now PaginatorView only has Prev/Next. Both "Start Deal on the listing
+I'm looking at" and "Edit/Cancel the listing I'm looking at" need a button
+whose label/custom_id/behavior changes as the user pages through results —
+same pattern already used successfully in ListingActionView.__init__
+(cogs/deals.py line ~31), which mutates a button's custom_id/label per
+instance. Extend that same mutate-in-place pattern to work per-PAGE instead
+of per-instance.
+
+Add an optional `action_buttons` param to PaginatorView.__init__ — a list
+(same length/order as `items`) where each entry is either None (no action
+button on that page) or a dict describing 1-2 buttons to show for that item,
+e.g. `{"label": "🤝 Start Deal", "style": discord.ButtonStyle.success,
+"callback": some_async_fn}`. Store it, and add a second row of up to 2
+button slots that get relabeled and rebound to the current page's callback
+every time _update_buttons() runs (same place Prev/Next disabled-state
+already gets refreshed) — e.g.:
+
+    def __init__(self, items, *, action_buttons: list[dict] | list[list[dict]] | None = None, timeout: float = 120.0):
+        ...
+        self._action_buttons = action_buttons  # one entry per item, aligned by index
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        self.prev_btn.disabled = self.page == 0
+        self.next_btn.disabled = self.page >= self.total_pages - 1
+        self._refresh_action_buttons()
+
+    def _refresh_action_buttons(self) -> None:
+        # Wire self.action_btn_1 / self.action_btn_2 (declared as real
+        # @discord.ui.button items on row=1, hidden/disabled when unused)
+        # to whatever the CURRENT page's item needs, mirroring how
+        # ListingActionView swaps label/custom_id in __init__.
+        start = self.page * self.per_page
+        configs = self._action_buttons[start] if self._action_buttons else None
+        ...
+
+Don't put deals-specific logic (calling _create_deal, opening PlaceBidModal,
+etc.) inside pagination.py — utils/ shouldn't import from cogs/. Instead,
+have each button's actual click handler be a plain callback function that
+gets passed in from wherever PaginatorView is constructed (listings.py),
+using the same local/deferred-import pattern already used in this codebase
+(see cogs/listings.py line 542, `from cogs.deals import ListingActionView`
+imported inside a function body, not at module level, specifically to avoid
+a circular import between cogs/listings.py and cogs/deals.py). pagination.py
+should stay generic; listings.py supplies the deal-specific or edit-specific
+behavior.
+
+Test this in isolation before moving on: build a PaginatorView with 3 fake
+items with 3 different action_buttons configs, page through all of them
+with simulated Prev/Next clicks, and confirm the correct label/callback is
+attached at each page — the same kind of check I ran on the footer-mutation
+bug last time. Get this right here; #3 and #4 both build on it.
+
+═══════════════════════════════════════════════════════════════════
+STEP 3 — Add Start Deal / Place Bid buttons inside Check Listings
+═══════════════════════════════════════════════════════════════════
+File: cogs/listings.py, _run_listing_query (around line 714)
+
+Currently: `embeds = [build_listing_embed(listing, profile) for listing, profile in rows]`
+— this only has the embed, not the listing_id/format needed to wire an
+action button. Change this to build BOTH the embeds list and a parallel
+action_buttons list, one entry per row, using the exact same logic
+ListingActionView.__init__ already uses to decide button label/behavior
+(cogs/deals.py lines 31-45):
+
+    embeds = []
+    action_buttons = []
+    for listing, profile in rows:
+        embeds.append(build_listing_embed(listing, profile))  # keep existing call
+        if listing.format == "auction":
+            action_buttons.append({
+                "label": "🔨 Place Bid",
+                "style": discord.ButtonStyle.success,
+                "callback": lambda i, lid=listing.listing_id: _open_bid_modal(i, lid),
+            })
+        else:
+            action_buttons.append({
+                "label": "🤝 Start Deal",
+                "style": discord.ButtonStyle.success,
+                "callback": lambda i, lid=listing.listing_id: _start_deal_from_paginator(i, lid),
+            })
+
+    paginator = PaginatorView(embeds, action_buttons=action_buttons)
+
+Watch the classic Python closure-in-a-loop bug here — capture listing_id as
+a default argument (`lid=listing.listing_id`) like the sketch above, not by
+referencing the loop variable directly, or every button will fire for
+whichever listing happened to be last in the loop.
+
+For the direct-sale case, _create_deal (cogs/deals.py line 90) currently
+assumes interaction.response was already deferred by the caller (see
+ListingActionView.start_deal_btn, which calls
+`interaction.response.defer(ephemeral=True)` before calling _create_deal).
+Whatever calls _create_deal from the paginator button must do the same
+defer first — write a small wrapper (`_start_deal_from_paginator` in the
+sketch above) rather than calling _create_deal directly, so this doesn't
+get missed.
+
+Note: _create_deal already refuses a seller starting a deal on their own
+listing (cogs/deals.py line ~157, "You can't start a deal with yourself.")
+— that's an existing guard, don't duplicate it in the button rendering.
+
+═══════════════════════════════════════════════════════════════════
+STEP 4 — Listings no longer post to a channel
+═══════════════════════════════════════════════════════════════════
+File: cogs/listings.py, _finalize_listing_inner, "Phase 4" block
+(around lines 477-507)
+
+Remove the entire Phase 4 block — the calls to _broadcast_global_listing
+and _post_listing_to_guild after a listing is created. A listing should now
+only ever be discoverable by browsing Check Listings (which STEP 3 above
+now makes fully actionable — Start Deal works from there too, so nothing
+is lost).
+
+IMPORTANT — do not confuse this with the persistent main panel. The 3(soon
+4)-button panel in cogs/panel_views.py (Create Listing / Check Listings /
+My IGN, posted once per guild in whatever channel GuildConfig.panel_channel_id
+points to) is a DIFFERENT thing from the per-listing embeds this step
+removes. Leave panel_channel_id, the panel-posting setup command, and
+MainPanelView completely alone — only stop posting the individual listing
+embed every time someone creates a listing.
+
+Once Phase 4 is gone, _post_listing_to_guild and _broadcast_global_listing
+(lines 510-560) have no remaining callers except maybe leftover imports —
+grep the whole repo for both names before deleting them outright, in case
+something else still calls them (e.g. a re-notify-on-renewal path in
+background_tasks.py). If nothing else calls them, delete them along with
+the now-unused `from cogs.deals import ListingActionView` import at line
+542 — don't leave dead code sitting there.
+
+Also check global_feed_channel_id and the "🌐 Global Feed Channel" setup
+button added a few rounds back (cogs/admin_setup.py) — that feature existed
+specifically to control WHERE global listings got posted. If listings never
+post to a channel at all anymore, that setting has no effect either.
+Decide: remove it too (cleaner), or leave the column/setter in place in
+case channel-posting comes back later. Tell me which you picked.
+
+═══════════════════════════════════════════════════════════════════
+STEP 5 — "My Listings" button + button-driven edit/cancel
+═══════════════════════════════════════════════════════════════════
+File: cogs/panel_views.py (new button) + cogs/listings.py (new handler)
+
+Add a 4th persistent button to MainPanelView (cogs/panel_views.py, after
+"🔍 Check Listings"):
+
+    @discord.ui.button(
+        label="📋 My Listings",
+        style=discord.ButtonStyle.secondary,
+        custom_id="panel:my_listings",
+    )
+    async def my_listings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        from cogs.listings import start_my_listings
+        await start_my_listings(interaction)
+
+Add `start_my_listings` in cogs/listings.py, following the same shape as
+start_check_listings — query the caller's own active listings:
+
+    async def start_my_listings(interaction: discord.Interaction):
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Listing).where(
+                    Listing.seller_id == interaction.user.id,
+                    Listing.status == "active",
+                )
+            )
+            rows = result.scalars().all()
+
+        if not rows:
+            await interaction.followup.send(
+                embed=discord.Embed(title="No active listings", description="You don't have any active listings right now.", color=discord.Color.greyple()),
+                ephemeral=True,
+            )
+            return
+
+        embeds = [build_listing_embed(listing) for listing in rows]
+        action_buttons = [
+            [
+                {"label": "✏️ Edit", "style": discord.ButtonStyle.primary,
+                 "callback": lambda i, l=listing: i.response.send_modal(EditListingModal(l))},
+                {"label": "🗑️ Cancel", "style": discord.ButtonStyle.danger,
+                 "callback": lambda i, lid=listing.listing_id: _cancel_listing_from_paginator(i, lid)},
+            ]
+            for listing in rows
+        ]
+        paginator = PaginatorView(embeds, action_buttons=action_buttons)
+        await interaction.followup.send(embed=paginator.current_page_embed(), view=paginator, ephemeral=True)
+
+This is exactly why STEP 2's action_buttons needs to support up to 2 buttons
+per page, not just 1 — My Listings needs Edit AND Cancel side by side,
+Check Listings only needs one. Same closure-capture caution as STEP 3
+applies to `l=listing` and `lid=listing.listing_id` here.
+
+Reuse EditListingModal exactly as it exists today (cogs/listings.py line
+866) — it already takes a full Listing object and already re-validates
+ownership + active status inside on_submit, so no changes needed there.
+
+For _cancel_listing_from_paginator, factor out the actual cancel logic
+already written inline in the /listing cancel command (cogs/listings.py
+lines 831-853) into a small reusable function both the slash command and
+this new button call, instead of duplicating the ownership/status checks
+in two places. Keep /listing cancel and /listing edit working exactly as
+they do now — this step adds a button-driven alternative, it doesn't
+replace the slash commands.
+
+Since My Listings only shows status == "active" listings, both action
+buttons only ever appear on listings that are actually editable/cancellable
+under the existing rules (listing_edit already checks status == "active"),
+so you shouldn't hit "can't edit a completed listing" in this flow at all
+— but keep the modal's own re-check as a safety net regardless, in case a
+listing's status changes between opening My Listings and clicking Edit.
+
+═══════════════════════════════════════════════════════════════════
+VERIFICATION
+═══════════════════════════════════════════════════════════════════
+1. Sort: create 3 listings at different prices, run Check Listings with
+   each sort button, confirm order is actually correct both directions.
+2. Paginator action buttons: page through Check Listings results with 3+
+   listings of mixed format (some auction, some direct sale) and confirm
+   the button always matches the listing currently on screen — click
+   Next/Prev repeatedly and re-verify, this is exactly the kind of "state
+   from a previous page leaks into the current one" bug that hit the
+   footer fix earlier.
+3. Create a listing and confirm nothing gets posted to any channel
+   anymore — only the ephemeral "Listing posted" confirmation and its
+   appearance in Check Listings / My Listings.
+4. Start a deal directly from within Check Listings (not from a channel
+   post, since those no longer exist) end to end.
+5. My Listings: confirm it only shows YOUR active listings, Edit actually
+   updates the listing, Cancel actually cancels it, and both disappear
+   from My Listings afterward (cancelled) or reflect the edit (edited).
+6. Confirm /listing edit and /listing cancel slash commands still work
+   unchanged.
+
+Tell me which decision you made on global_feed_channel_id (kept or
+removed) and anything you weren't sure about.

@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 _DB_PATH = Path(__file__).parent / "snag.db"
 _DB_URL = f"sqlite+aiosqlite:///{_DB_PATH}"
 
+# Public export so other modules can log/check the file path without re-deriving it.
+DB_PATH: Path = _DB_PATH
+
 # StaticPool keeps a single connection open and reuses it — correct for SQLite
 # in an async single-process bot.  check_same_thread=False is required for
 # SQLite when the same connection is accessed from multiple coroutines.

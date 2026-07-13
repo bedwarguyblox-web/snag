@@ -25,7 +25,6 @@ from config import (
     LISTING_DESCRIPTION_MAX_LEN,
     LISTINGS_QUERY_HARD_LIMIT,
     DUPLICATE_LISTING_WINDOW_SECONDS,
-    GLOBAL_BROADCAST_DELAY,
     LISTING_EXPIRY_DAYS,
 )
 from database.engine import AsyncSessionLocal
@@ -324,7 +323,7 @@ class ConfirmListingView(discord.ui.View):
 
 
 async def _finalize_listing(interaction: discord.Interaction, wizard: ListingWizardState):
-    """Write the listing row to DB and broadcast to guilds."""
+    """Write the listing row to DB and notify the user."""
     user_id = interaction.user.id
     guild_id = interaction.guild_id
 
@@ -474,92 +473,6 @@ async def _finalize_listing_inner(
         ephemeral=True,
     )
 
-    # ── Phase 4: broadcast to channel(s) — best-effort, never crash confirm ─
-    bot = interaction.client
-
-    # Re-fetch listing + profile in a fresh session so attributes are loaded.
-    db_listing: Listing | None = None
-    db_profile: UserProfile | None = None
-    try:
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(Listing, UserProfile)
-                .join(UserProfile, UserProfile.user_id == Listing.seller_id)
-                .where(Listing.listing_id == listing_id)
-            )
-            row = result.first()
-        if row:
-            db_listing, db_profile = row
-    except Exception:
-        logger.exception("_finalize_listing: failed to re-fetch listing #%d for channel post", listing_id)
-
-    if db_listing and db_profile:
-        try:
-            if wizard.scope == "global":
-                await _broadcast_global_listing(bot, db_listing, db_profile, guild_id)
-            else:
-                await _post_listing_to_guild(bot, guild_id, db_listing, db_profile)
-        except Exception:
-            logger.exception(
-                "_finalize_listing: channel post failed for listing #%d (listing saved OK)", listing_id
-            )
-    else:
-        logger.warning("_finalize_listing: skipping channel post for listing #%d — row not found", listing_id)
-
-
-async def _post_listing_to_guild(bot, guild_id: int, listing: Listing, profile: UserProfile):
-    config = guild_cache.get(guild_id)
-    if config is None:
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(select(GuildConfig).where(GuildConfig.guild_id == guild_id))
-            config = result.scalar_one_or_none()
-            if config:
-                guild_cache.set(config)
-
-    if not config or not config.panel_channel_id:
-        logger.warning("_post_listing_to_guild: guild %d has no panel_channel_id configured", guild_id)
-        return
-
-    channel_id = config.global_feed_channel_id or config.panel_channel_id
-    channel = bot.get_channel(channel_id)
-    if not channel:
-        # Channel not in local cache — fetch from Discord API
-        try:
-            channel = await bot.fetch_channel(channel_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-            logger.warning(
-                "_post_listing_to_guild: could not fetch channel %d for guild %d: %s",
-                channel_id, guild_id, exc,
-            )
-            return
-
-    try:
-        color = int((config.embed_color or "#5865F2").lstrip("#"), 16)
-    except ValueError:
-        color = 0x5865F2
-    embed = build_listing_embed(listing, profile, guild_color=color)
-
-    from cogs.deals import ListingActionView
-    view = ListingActionView(listing.listing_id, listing.format)
-
-    try:
-        await channel.send(embed=embed, view=view)
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        logger.warning("Failed to post listing to guild %d channel %d: %s", guild_id, channel_id, exc)
-
-
-async def _broadcast_global_listing(bot, listing: Listing, profile: UserProfile, origin_guild_id: int):
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(GuildConfig).where(GuildConfig.allow_global_listings == True)
-        )
-        configs = result.scalars().all()
-
-    for config in configs:
-        await _post_listing_to_guild(bot, config.guild_id, listing, profile)
-        await asyncio.sleep(GLOBAL_BROADCAST_DELAY)
-
-
 # ─── Check listings / filter flow ────────────────────────────────────────────
 
 class SearchModal(discord.ui.Modal, title="Search Listings"):
@@ -646,13 +559,27 @@ class FilterView(discord.ui.View):
     async def server_listings(self, interaction: discord.Interaction, _):
         await interaction.response.defer(ephemeral=True)
         self._filters["scope"] = "server"
+        self._filters["_last_guild_id"] = interaction.guild_id  # remembered so sort re-runs keep the guild scope
         await _run_listing_query(interaction, self._filters, guild_id=interaction.guild_id)
 
     @discord.ui.button(label="🌐 Global Listings", style=discord.ButtonStyle.secondary, custom_id="filter:global_listings", row=4)
     async def global_listings(self, interaction: discord.Interaction, _):
         await interaction.response.defer(ephemeral=True)
         self._filters["scope"] = "global"
+        self._filters.pop("_last_guild_id", None)
         await _run_listing_query(interaction, self._filters)
+
+    @discord.ui.button(label="💰 Price: Low→High", style=discord.ButtonStyle.secondary, custom_id="filter:sort_low", row=4)
+    async def sort_low(self, interaction: discord.Interaction, _):
+        await interaction.response.defer(ephemeral=True)
+        self._filters["sort"] = "price_asc"
+        await _run_listing_query(interaction, self._filters, guild_id=self._filters.get("_last_guild_id"))
+
+    @discord.ui.button(label="💰 Price: High→Low", style=discord.ButtonStyle.secondary, custom_id="filter:sort_high", row=4)
+    async def sort_high(self, interaction: discord.Interaction, _):
+        await interaction.response.defer(ephemeral=True)
+        self._filters["sort"] = "price_desc"
+        await _run_listing_query(interaction, self._filters, guild_id=self._filters.get("_last_guild_id"))
 
 
 async def _run_listing_query(interaction: discord.Interaction, filters: dict, guild_id: int | None = None):
@@ -696,6 +623,15 @@ async def _run_listing_query(interaction: discord.Interaction, filters: dict, gu
                 )
             )
 
+        # Price sort — NULLs always last regardless of direction.
+        # SQLite treats NULL < any value, so ASC would put NULLs first by default;
+        # ordering by price.is_(None) first (False=0 < True=1) fixes both directions.
+        sort = filters.get("sort")
+        if sort == "price_asc":
+            q = q.order_by(Listing.price.is_(None), Listing.price.asc())
+        elif sort == "price_desc":
+            q = q.order_by(Listing.price.is_(None), Listing.price.desc())
+
         q = q.limit(LISTINGS_QUERY_HARD_LIMIT)
         result = await session.execute(q)
         rows = result.all()
@@ -711,8 +647,26 @@ async def _run_listing_query(interaction: discord.Interaction, filters: dict, gu
         )
         return
 
-    embeds = [build_listing_embed(listing, profile) for listing, profile in rows]
-    paginator = PaginatorView(embeds)
+    embeds = []
+    action_buttons = []
+    for listing, profile in rows:
+        embeds.append(build_listing_embed(listing, profile))
+        # lambda default-captures listing_id to avoid the classic closure-in-loop bug
+        # where every button would fire for whichever listing was last in the loop.
+        if listing.format == "auction":
+            action_buttons.append({
+                "label": "🔨 Place Bid",
+                "style": discord.ButtonStyle.success,
+                "callback": lambda i, lid=listing.listing_id: _open_bid_from_paginator(i, lid),
+            })
+        else:
+            action_buttons.append({
+                "label": "🤝 Start Deal",
+                "style": discord.ButtonStyle.success,
+                "callback": lambda i, lid=listing.listing_id: _start_deal_from_paginator(i, lid),
+            })
+
+    paginator = PaginatorView(embeds, action_buttons=action_buttons)
     await interaction.followup.send(
         embed=paginator.current_page_embed(),
         view=paginator,
@@ -792,6 +746,114 @@ async def start_check_listings(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
+# ─── Paginator action callbacks (called by PaginatorView action_btn slots) ────
+# Local imports inside each wrapper prevent circular imports between
+# cogs/listings.py and cogs/deals.py (same pattern as the existing local import
+# of ListingActionView that previously lived inside _post_listing_to_guild).
+
+async def _start_deal_from_paginator(interaction: discord.Interaction, listing_id: int) -> None:
+    """Defer + delegate to _create_deal from a paginator Start Deal button."""
+    from cogs.deals import _create_deal
+    await interaction.response.defer(ephemeral=True)
+    await _create_deal(interaction, listing_id)
+
+
+async def _open_bid_from_paginator(interaction: discord.Interaction, listing_id: int) -> None:
+    """Open the bid modal from a paginator Place Bid button (no prior defer allowed)."""
+    from cogs.deals import _open_bid_modal
+    await _open_bid_modal(interaction, listing_id)
+
+
+# ─── Shared cancel logic (used by /listing cancel and My Listings button) ─────
+
+async def _do_cancel_listing(interaction: discord.Interaction, listing_id: int) -> bool:
+    """
+    Ownership-verified cancel of a single listing.  Opens its own DB session.
+    Returns True if the listing was cancelled successfully.
+    Returns False and sends an ephemeral error to the user if any check fails.
+    Caller must have already deferred the interaction before calling this.
+    """
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            result = await session.execute(select(Listing).where(Listing.listing_id == listing_id))
+            listing = result.scalar_one_or_none()
+            if not listing:
+                await interaction.followup.send(embed=build_error_embed("Listing not found."), ephemeral=True)
+                return False
+            if listing.seller_id != interaction.user.id:
+                await interaction.followup.send(embed=build_error_embed("You can only cancel your own listings."), ephemeral=True)
+                return False
+            if listing.status not in ("active",):
+                await interaction.followup.send(embed=build_error_embed("This listing can't be cancelled."), ephemeral=True)
+                return False
+            listing.status = "cancelled"
+    return True
+
+
+async def _cancel_listing_from_paginator(interaction: discord.Interaction, listing_id: int) -> None:
+    """My Listings paginator Cancel button — defers, cancels, confirms."""
+    await interaction.response.defer(ephemeral=True)
+    if await _do_cancel_listing(interaction, listing_id):
+        await interaction.followup.send(
+            embed=build_success_embed(f"Listing #{listing_id} cancelled."),
+            ephemeral=True,
+        )
+
+
+# ─── My Listings entry point (called from panel My Listings button) ───────────
+
+async def start_my_listings(interaction: discord.Interaction) -> None:
+    """Show the caller's own active listings with inline Edit and Cancel buttons."""
+    if not await check_marketplace_access(interaction):
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Listing).where(
+                Listing.seller_id == interaction.user.id,
+                Listing.status == "active",
+            )
+        )
+        rows = result.scalars().all()
+
+    if not rows:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="No active listings",
+                description="You don't have any active listings right now.",
+                color=discord.Color.greyple(),
+            ),
+            ephemeral=True,
+        )
+        return
+
+    embeds = [build_listing_embed(listing) for listing in rows]
+    # Two action buttons per page: Edit (opens modal) and Cancel.
+    # Default-argument capture (l=listing, lid=listing.listing_id) prevents the
+    # classic closure-in-loop bug where every button would fire for the last item.
+    action_buttons = [
+        [
+            {
+                "label": "✏️ Edit",
+                "style": discord.ButtonStyle.primary,
+                # send_modal is a coroutine method — lambda returns the coroutine,
+                # which PaginatorView's action_btn handler then awaits.
+                "callback": lambda i, l=listing: i.response.send_modal(EditListingModal(l)),
+            },
+            {
+                "label": "🗑️ Cancel",
+                "style": discord.ButtonStyle.danger,
+                "callback": lambda i, lid=listing.listing_id: _cancel_listing_from_paginator(i, lid),
+            },
+        ]
+        for listing in rows
+    ]
+    paginator = PaginatorView(embeds, action_buttons=action_buttons)
+    await interaction.followup.send(
+        embed=paginator.current_page_embed(), view=paginator, ephemeral=True
+    )
+
+
 # ─── Slash commands: /listing edit, /listing cancel ──────────────────────────
 
 class Listings(commands.Cog):
@@ -830,27 +892,11 @@ class Listings(commands.Cog):
     @app_commands.describe(listing_id="The listing ID to cancel")
     async def listing_cancel(self, interaction: discord.Interaction, listing_id: int):
         await interaction.response.defer(ephemeral=True)
-        async with AsyncSessionLocal() as session:
-            async with session.begin():
-                result = await session.execute(
-                    select(Listing).where(Listing.listing_id == listing_id)
-                )
-                listing = result.scalar_one_or_none()
-                if not listing:
-                    await interaction.followup.send(embed=build_error_embed("Listing not found."), ephemeral=True)
-                    return
-                if listing.seller_id != interaction.user.id:
-                    await interaction.followup.send(embed=build_error_embed("You can only cancel your own listings."), ephemeral=True)
-                    return
-                if listing.status not in ("active",):
-                    await interaction.followup.send(embed=build_error_embed("This listing can't be cancelled."), ephemeral=True)
-                    return
-                listing.status = "cancelled"
-
-        await interaction.followup.send(
-            embed=build_success_embed(f"Listing #{listing_id} cancelled."),
-            ephemeral=True,
-        )
+        if await _do_cancel_listing(interaction, listing_id):
+            await interaction.followup.send(
+                embed=build_success_embed(f"Listing #{listing_id} cancelled."),
+                ephemeral=True,
+            )
 
 
 class _EditListingLaunchView(discord.ui.View):

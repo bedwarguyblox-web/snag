@@ -1,0 +1,160 @@
+Snag Bot — Add a Real Storage Retention Policy (archive purge + VACUUM)
+
+Confirmed by reading background_tasks.py: the existing weekly archive_sweep
+task (hours=ARCHIVE_SWEEP_HOURS, in background_tasks.py) only MOVES old
+listings/bids from the hot tables into listing_archive/bid_archive after
+ARCHIVE_AFTER_DAYS (90 days). Nothing ever deletes rows from those archive
+tables, and nothing ever reclaims freed disk space. snag.db will grow
+indefinitely for as long as the bot runs — slowly, but with no ceiling.
+
+Add two things: a real purge of old archived data, and a periodic VACUUM so
+SQLite actually shrinks the file on disk (deleting rows alone doesn't do
+this — SQLite just marks the space as reusable internally and keeps the
+same file size until VACUUM rewrites the file).
+
+═══════════════════════════════════════════════════════════════════
+STEP 1 — Add retention config
+═══════════════════════════════════════════════════════════════════
+In config.py, near the existing ARCHIVE_AFTER_DAYS / ARCHIVE_SWEEP_HOURS
+constants, add:
+
+    ARCHIVE_PURGE_AFTER_DAYS: int = 730   # hard-delete archive rows after 2 years
+    VACUUM_SWEEP_HOURS: int = 720         # monthly (30 * 24)
+
+Pick 730 as a starting default — ask me if you think a marketplace bot like
+this needs archived listings kept longer for dispute resolution before
+you hard-delete them; if there's any chance a mod needs to look up a
+listing from 18 months ago, err longer rather than shorter, since this step
+is irreversible.
+
+═══════════════════════════════════════════════════════════════════
+STEP 2 — Purge old archive rows (irreversible, so batch + log clearly)
+═══════════════════════════════════════════════════════════════════
+In background_tasks.py, add a new sweep task following the exact pattern of
+the existing sweeps (own try/except so it can't take down other loops,
+registered in register_tasks()):
+
+    @tasks.loop(hours=ARCHIVE_SWEEP_HOURS)
+    async def archive_purge_sweep(bot: "Bot") -> None:
+        """
+        Permanently delete listing_archive/bid_archive rows older than
+        ARCHIVE_PURGE_AFTER_DAYS. This is irreversible — archived data past
+        this age is gone for good, not just moved.
+        """
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=ARCHIVE_PURGE_AFTER_DAYS)
+            async with AsyncSessionLocal() as session:
+                async with session.begin():
+                    old_listing_archives = await session.execute(
+                        select(ListingArchive).where(ListingArchive.created_at < cutoff)
+                    )
+                    listings_to_purge = old_listing_archives.scalars().all()
+                    listing_ids = [l.listing_id for l in listings_to_purge]
+
+                    if listing_ids:
+                        old_bid_archives = await session.execute(
+                            select(BidArchive).where(BidArchive.listing_id.in_(listing_ids))
+                        )
+                        for bid in old_bid_archives.scalars().all():
+                            await session.delete(bid)
+                        for listing in listings_to_purge:
+                            await session.delete(listing)
+
+            if listing_ids:
+                logger.info(
+                    "Archive purge: permanently deleted %d listing(s) and their bids, older than %d days.",
+                    len(listing_ids), ARCHIVE_PURGE_AFTER_DAYS,
+                )
+        except Exception as exc:
+            logger.error("archive_purge_sweep failed: %s", exc)
+
+    @archive_purge_sweep.error
+    async def archive_purge_sweep_error(error: Exception) -> None:
+        logger.error("archive_purge_sweep loop error: %s", error)
+
+Reuse ARCHIVE_SWEEP_HOURS for the loop interval (run it right after the
+regular archive sweep, same cadence, so newly-archived-then-purge-eligible
+data gets caught promptly) — don't invent a third interval unless you have
+a reason to.
+
+Add `archive_purge_sweep.start(bot)` to register_tasks(), after
+archive_sweep.start(bot).
+
+═══════════════════════════════════════════════════════════════════
+STEP 3 — Periodic VACUUM to actually reclaim disk space
+═══════════════════════════════════════════════════════════════════
+Deleting rows (step 2) frees space *inside* the SQLite file for reuse, but
+does NOT shrink the .db file on disk. Only VACUUM does that, and it has to
+run outside any open transaction (SQLite requires autocommit mode for it,
+and it needs exclusive access to the database for its duration).
+
+Add to background_tasks.py:
+
+    import os
+    from database.engine import engine  # the underlying AsyncEngine, not AsyncSessionLocal
+
+    @tasks.loop(hours=VACUUM_SWEEP_HOURS)
+    async def vacuum_sweep(bot: "Bot") -> None:
+        """
+        Reclaim disk space freed by deleted rows. VACUUM requires exclusive
+        DB access and briefly blocks other operations — run infrequently,
+        not more than monthly, and expect it to pause other DB activity for
+        the duration (typically sub-second to a few seconds for a bot this
+        size, but grows with DB size).
+        """
+        try:
+            db_path = "database/snag.db"  # confirm this matches the real path in engine.py
+            size_before = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+
+            async with engine.connect() as conn:
+                await conn.execution_options(isolation_level="AUTOCOMMIT")
+                await conn.exec_driver_sql("VACUUM")
+
+            size_after = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+            freed_mb = (size_before - size_after) / (1024 * 1024)
+            logger.info(
+                "VACUUM complete: %.2f MB freed (%.2f MB -> %.2f MB).",
+                freed_mb, size_before / 1024 / 1024, size_after / 1024 / 1024,
+            )
+        except Exception as exc:
+            logger.error("vacuum_sweep failed: %s", exc)
+
+    @vacuum_sweep.error
+    async def vacuum_sweep_error(error: Exception) -> None:
+        logger.error("vacuum_sweep loop error: %s", error)
+
+Add `vacuum_sweep.start(bot)` to register_tasks().
+
+Two things to get right here, don't skip either:
+  a) Confirm the actual variable name for the engine in database/engine.py
+     (it may be named differently than `engine` — check before importing)
+     and confirm it's the raw AsyncEngine, not the AsyncSessionLocal
+     sessionmaker, since VACUUM needs to run outside the ORM session layer.
+  b) VACUUM needs roughly as much free disk space as the CURRENT database
+     size while it runs, since it writes a full rewritten copy before
+     replacing the original. For a bot this size that's very unlikely to
+     matter, but if the host is ever already near its disk limit, running
+     VACUUM at that moment could make things worse, not better. If you
+     want to be extra safe, only trigger VACUUM when the freed-by-deletes
+     space is meaningfully large (skip the run if step 2 purged nothing).
+
+═══════════════════════════════════════════════════════════════════
+STEP 4 — Verify, log, and document
+═══════════════════════════════════════════════════════════════════
+1. Log the size of database/snag.db (or wherever it actually lives) on
+   every bot startup, so there's a visible trend over time in the logs
+   without needing to manually check.
+2. Manually trigger both new sweeps once (temporarily call them directly,
+   or temporarily set the loop interval very low) against a COPY of the
+   real database, not the live one, and confirm: old archive rows are
+   actually gone afterward, and the .db file is smaller after VACUUM than
+   before it (assuming there was something to reclaim).
+3. Update .agents/memory/ with a short entry noting the retention policy
+   now in place (ARCHIVE_PURGE_AFTER_DAYS, VACUUM_SWEEP_HOURS, and that
+   the archive purge is irreversible by design) — this is the kind of
+   decision a future session should know already exists rather than
+   re-derive or accidentally duplicate.
+
+Tell me the actual current size of snag.db and how many rows exist in
+listing_archive/bid_archive before you do any of this, so there's a
+baseline to compare against afterward.

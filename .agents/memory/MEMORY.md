@@ -1,2 +1,3 @@
 - [SQLite autoincrement PK type](sqlite-autoincrement-pk.md) — SQLAlchemy PKs must be `Integer`, not `BigInteger`/`BigInteger`-derived, for SQLite auto-assign to work at all.
 - [Schema migration lessons](schema-migration-lessons.md) — create_all() silently no-ops on existing tables; every model field needs a confirmed write path before it's trusted to work.
+- [Snag architecture decisions](snag-arch-decisions.md) — key design decisions: no channel posting, PaginatorView action_buttons pattern, retention policy constants.

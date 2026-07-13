@@ -120,43 +120,6 @@ class SetLogChannelModal(discord.ui.Modal, title="Set Log Channel ID"):
         )
 
 
-class SetGlobalFeedChannelModal(discord.ui.Modal, title="Set Global Feed Channel ID"):
-    channel_id_input = discord.ui.TextInput(
-        label="Global Feed Channel ID",
-        placeholder="Paste the channel snowflake ID (or 0 to clear)",
-        max_length=20,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        raw = self.channel_id_input.value.strip()
-        try:
-            cid = int(raw)
-        except ValueError:
-            await interaction.response.send_message(
-                embed=build_error_embed("That doesn't look like a valid channel ID."),
-                ephemeral=True,
-            )
-            return
-        async with AsyncSessionLocal() as session:
-            async with session.begin():
-                config = await _get_or_create_config(interaction.guild_id, session)
-                config.global_feed_channel_id = cid if cid != 0 else None
-        guild_cache.invalidate(interaction.guild_id)
-        if cid == 0:
-            await interaction.response.send_message(
-                embed=build_success_embed("Global feed channel cleared."),
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                embed=build_success_embed(
-                    f"Global feed channel set to <#{cid}>.\n"
-                    f"Global listings will now be broadcast here instead of the panel channel."
-                ),
-                ephemeral=True,
-            )
-
-
 class SetAdminRoleModal(discord.ui.Modal, title="Set Admin Role ID"):
     role_id_input = discord.ui.TextInput(
         label="Admin Role ID",
@@ -287,15 +250,6 @@ class SetupView(discord.ui.View):
         await interaction.response.send_modal(SetLogChannelModal())
 
     @discord.ui.button(
-        label="Set Global Feed Channel",
-        style=discord.ButtonStyle.secondary,
-        custom_id="setup:global_feed_channel",
-        row=4,
-    )
-    async def set_global_feed_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SetGlobalFeedChannelModal())
-
-    @discord.ui.button(
         label="Set Admin Role",
         style=discord.ButtonStyle.secondary,
         custom_id="setup:admin_role",
@@ -335,7 +289,6 @@ class AdminSetup(commands.Cog):
                 f"**Server Listings:** {'✅ Enabled' if config.allow_server_listings else '❌ Disabled'}\n"
                 f"**Custom Categories:** {', '.join(config.custom_categories) or '*(none)*'}\n"
                 f"**Log Channel:** {'<#' + str(config.log_channel_id) + '>' if config.log_channel_id else '*(not set)*'}\n"
-                f"**Global Feed Channel:** {'<#' + str(config.global_feed_channel_id) + '>' if config.global_feed_channel_id else '*(not set)*'}\n"
                 f"**Admin Role:** {'<@&' + str(config.admin_role_id) + '>' if config.admin_role_id else '*(not set)*'}"
             ),
             color=embed_color_int,
@@ -425,6 +378,7 @@ async def _do_send_panel(interaction: discord.Interaction, channel: discord.Text
             "Welcome to the **Snag** cross-server trading marketplace!\n\n"
             "• **Create Listing** — Post an item, service, or bid for sale\n"
             "• **Check Listings** — Browse and filter active listings\n"
+            "• **My Listings** — View, edit, or cancel your own active listings\n"
             "• **My IGN** — Set your in-game name for buyers/sellers to see"
         ),
         color=color,

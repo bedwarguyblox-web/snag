@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from discord.ext import tasks
@@ -21,8 +23,10 @@ from config import (
     LISTING_EXPIRY_RENEW_NOTIFY_HOURS_BEFORE,
     ARCHIVE_AFTER_DAYS,
     ARCHIVE_SWEEP_HOURS,
+    ARCHIVE_PURGE_AFTER_DAYS,
+    VACUUM_SWEEP_HOURS,
 )
-from database.engine import AsyncSessionLocal
+from database.engine import AsyncSessionLocal, engine, DB_PATH
 from database.models import Deal, Listing, UserProfile, GuildConfig, ListingArchive, BidArchive, Bid
 
 if TYPE_CHECKING:
@@ -37,6 +41,8 @@ def register_tasks(bot: "Bot") -> None:
     auction_end_sweep.start(bot)
     listing_expiry_sweep.start(bot)
     archive_sweep.start(bot)
+    archive_purge_sweep.start(bot)
+    vacuum_sweep.start(bot)
 
 
 # ─── Deal timeout sweep (every 15 minutes) ────────────────────────────────────
@@ -473,3 +479,83 @@ async def archive_sweep(bot: "Bot") -> None:
 @archive_sweep.error
 async def archive_sweep_error(error: Exception) -> None:
     logger.error("archive_sweep loop error: %s", error)
+
+
+# ─── Archive purge sweep (weekly, same cadence as archive_sweep) ──────────────
+
+@tasks.loop(hours=ARCHIVE_SWEEP_HOURS)
+async def archive_purge_sweep(bot: "Bot") -> None:
+    """
+    Permanently delete listing_archive / bid_archive rows older than
+    ARCHIVE_PURGE_AFTER_DAYS.  This is irreversible — archived data past this
+    age is gone for good, not moved.  Runs on the same cadence as archive_sweep
+    so newly-archived rows become eligible promptly after retention expires.
+    """
+    listing_ids: list[int] = []
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=ARCHIVE_PURGE_AFTER_DAYS)
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                old_listings = await session.execute(
+                    select(ListingArchive).where(ListingArchive.archived_at < cutoff)
+                )
+                listings_to_purge = old_listings.scalars().all()
+                listing_ids = [la.listing_id for la in listings_to_purge]
+
+                if listing_ids:
+                    old_bids = await session.execute(
+                        select(BidArchive).where(BidArchive.listing_id.in_(listing_ids))
+                    )
+                    for bid in old_bids.scalars().all():
+                        await session.delete(bid)
+                    for listing in listings_to_purge:
+                        await session.delete(listing)
+
+        if listing_ids:
+            logger.info(
+                "Archive purge: permanently deleted %d archived listing(s) and their bids "
+                "(older than %d days).  This deletion is irreversible.",
+                len(listing_ids),
+                ARCHIVE_PURGE_AFTER_DAYS,
+            )
+    except Exception as exc:
+        logger.error("archive_purge_sweep failed: %s", exc)
+
+
+@archive_purge_sweep.error
+async def archive_purge_sweep_error(error: Exception) -> None:
+    logger.error("archive_purge_sweep loop error: %s", error)
+
+
+# ─── Monthly VACUUM to actually reclaim disk space ────────────────────────────
+
+@tasks.loop(hours=VACUUM_SWEEP_HOURS)
+async def vacuum_sweep(bot: "Bot") -> None:
+    """
+    Reclaim disk space freed by deleted rows.  Deleting rows alone only marks
+    space as reusable inside SQLite's file — VACUUM rewrites the file to shrink
+    it on disk.  Brief exclusive DB lock during rewrite; typically sub-second
+    for a bot this size but grows with DB size.  Run monthly at most.
+    """
+    try:
+        size_before = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+
+        async with engine.connect() as conn:
+            await conn.execution_options(isolation_level="AUTOCOMMIT")
+            await conn.exec_driver_sql("VACUUM")
+
+        size_after = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+        freed_mb = (size_before - size_after) / (1024 * 1024)
+        logger.info(
+            "VACUUM complete: %.3f MB freed (%.3f MB → %.3f MB).",
+            freed_mb,
+            size_before / 1024 / 1024,
+            size_after / 1024 / 1024,
+        )
+    except Exception as exc:
+        logger.error("vacuum_sweep failed: %s", exc)
+
+
+@vacuum_sweep.error
+async def vacuum_sweep_error(error: Exception) -> None:
+    logger.error("vacuum_sweep loop error: %s", error)

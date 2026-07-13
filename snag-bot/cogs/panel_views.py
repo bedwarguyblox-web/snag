@@ -1,5 +1,5 @@
 """
-Persistent View classes for the 3 main panel buttons.
+Persistent View classes for the 4 main panel buttons.
 Registered in setup_hook() with fixed custom_ids so they survive restarts.
 """
 
@@ -11,7 +11,7 @@ from discord.ext import commands
 
 class MainPanelView(discord.ui.View):
     """
-    The permanent 3-button panel.  Registered on setup_hook with timeout=None
+    The permanent 4-button panel.  Registered on setup_hook with timeout=None
     so it persists across restarts.
     """
 
@@ -37,6 +37,16 @@ class MainPanelView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         from cogs.listings import start_check_listings
         await start_check_listings(interaction)
+
+    @discord.ui.button(
+        label="📋 My Listings",
+        style=discord.ButtonStyle.secondary,
+        custom_id="panel:my_listings",
+    )
+    async def my_listings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        from cogs.listings import start_my_listings
+        await start_my_listings(interaction)
 
     @discord.ui.button(
         label="🎮 My IGN",

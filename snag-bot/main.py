@@ -54,8 +54,15 @@ async def setup_hook() -> None:
     multiple times across reconnects and duplicate registration must be idempotent.
     """
     # ── Create DB tables ──────────────────────────────────────────────────
-    from database.engine import create_all_tables
+    from database.engine import create_all_tables, DB_PATH
     await create_all_tables()
+
+    # Log DB size on startup for disk-usage trend tracking over time.
+    if DB_PATH.exists():
+        size_mb = DB_PATH.stat().st_size / (1024 * 1024)
+        logger.info("Database size on startup: %.3f MB (%s)", size_mb, DB_PATH)
+    else:
+        logger.info("Database not yet created — will be initialized now.")
 
     # ── Load cogs ─────────────────────────────────────────────────────────
     for cog in COGS:
