@@ -1,0 +1,48 @@
+The live database is still out of sync with models.py, and it's now causing
+a runtime crash: sqlite3.OperationalError: no such column:
+user_profiles.completed_deals (see attached traceback from listings.py
+_finalize_listing_inner -> get_or_create_profile).
+
+Don't just patch this one column — audit the whole schema against models.py
+in one pass, since this is the second time a missing/wrong column has
+surfaced as a live crash, and there are known-pending schema changes from
+earlier fixes that may or may not have been applied.
+
+1. Connect to the ACTUAL LIVE snag.db this bot is running against (not a
+   local/fresh copy) and run PRAGMA table_info() on every table models.py
+   defines: guild_configs, user_profiles, guild_bans, listings, bids, deals,
+   reviews, reports, listing_archive, bid_archive. Compare each column
+   list/type against the current models.py.
+
+2. Fix everything that's out of sync in one migration pass, back up snag.db
+   first (cp snag.db snag.db.bak):
+   - user_profiles.completed_deals is confirmed missing right now — add it:
+     ALTER TABLE user_profiles ADD COLUMN completed_deals INTEGER DEFAULT 0;
+   - Check listings.listing_id is declared as exactly "INTEGER PRIMARY KEY"
+     (not BIGINT) — this is the original autoincrement crash. SQLite only
+     rowid-aliases a column declared with the literal type INTEGER as PK; if
+     it's still BigInteger, ALTER TABLE can't fix a PK/type change in place,
+     you need to rebuild the table (create corrected table, copy rows across,
+     drop old, rename) and must preserve any real existing listings when
+     doing so.
+   - Check bids.listing_id and deals.listing_id — these were changed to
+     Integer in models.py for consistency, but note SQLite's type affinity
+     means this specific mismatch likely isn't causing runtime errors even
+     if unmigrated, so it's lower urgency than the two above but still
+     worth fixing in the same pass since you're already in there.
+
+3. After migrating, restart the bot and actually run through the full flow
+   live: create a listing, complete a deal end to end (to exercise the
+   completed_deals increment), and confirm no OperationalError anywhere in
+   the logs — not just that the specific column in this traceback is gone.
+
+4. Update .agents/memory/schema-migration-lessons.md with what actually
+   happened here: that a schema change shipped in code without the live DB
+   being migrated alongside it, and it went undetected until a user hit it
+   in production. That's the recurring failure mode across this whole
+   debugging session — worth its own memory entry so it's the first thing
+   checked next time a model field changes.
+
+Report back exactly what PRAGMA table_info found was out of sync before you
+fixed it, not just "fixed" — I want to know how much drift had actually
+accumulated.
